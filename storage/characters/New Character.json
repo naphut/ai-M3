@@ -1,0 +1,16 @@
+{
+  "name": "New Character",
+  "gender": "female",
+  "age": "adult",
+  "emotion": "friendly",
+  "style": "conversational",
+  "pitch": "medium",
+  "speed": 1.0,
+  "voice_description": "A natural adult female voice speaking Khmer.\nClear Khmer pronunciation.\nWarm and realistic vocal tone.\nMedium pitch.\nFriendly and conversational speaking style.\nNatural breathing and natural pauses.\nNatural intonation and rhythm.\nHuman-like articulation.\nDo not sound robotic.\nDo not sound synthetic.",
+  "language": "km",
+  "is_clone": true,
+  "reference_audio": "/Users/retnaphut/Downloads/Download (2).mp4",
+  "reference_text": null,
+  "pitch_shift": 1.0,
+  "eq_preset": "balanced"
+}

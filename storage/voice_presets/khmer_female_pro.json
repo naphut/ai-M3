@@ -1,0 +1,12 @@
+{
+  "name": "Khmer Female Pro",
+  "mode": "voice_generation",
+  "gender": "female",
+  "age": "adult",
+  "style": "professional",
+  "emotion": "calm",
+  "pitch": "medium",
+  "speed": 1.0,
+  "language": "km",
+  "voice_description": ""
+}

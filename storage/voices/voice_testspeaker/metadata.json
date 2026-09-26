@@ -1,0 +1,13 @@
+{
+  "voice_id": "voice_testspeaker",
+  "name": "TestSpeaker",
+  "language": "km",
+  "reference_audio": "reference.wav",
+  "reference_text": "reference.txt",
+  "reference_audio_path": "/Users/retnaphut/Documents/vide ai/storage/voices/voice_testspeaker/reference.wav",
+  "prompt_text": "Sample reference speech.",
+  "gender": "female",
+  "age": "adult",
+  "status": "ready",
+  "is_clone": true
+}

@@ -1,0 +1,12 @@
+{
+  "name": "Khmer Male Natural",
+  "mode": "voice_generation",
+  "gender": "male",
+  "age": "adult",
+  "style": "natural",
+  "emotion": "friendly",
+  "pitch": "medium",
+  "speed": 1.0,
+  "language": "km",
+  "voice_description": "A natural adult male voice speaking Khmer.\nClear Khmer pronunciation.\nWarm and realistic vocal tone.\nMedium-low pitch.\nNatural breathing and natural pauses.\nConversational speaking style.\nConfident, friendly and relaxed.\nNatural intonation and rhythm.\nHuman-like articulation.\nDo not sound robotic.\nDo not sound synthetic."
+}
