@@ -491,8 +491,14 @@ app.post('/api/load-local-audio', (req, res) => {
 
     const stat = fs.statSync(filePath);
     const fileName = path.basename(filePath);
-    const ext = fileName.split('.').pop()?.toLowerCase();
-    const mimeType = ext === 'wav' ? 'audio/wav' : ext === 'm4a' ? 'audio/m4a' : 'audio/mp3';
+    const ext = path.extname(filePath).toLowerCase();
+    let mimeType = 'audio/mp3';
+    if (ext === '.wav') mimeType = 'audio/wav';
+    else if (ext === '.m4a' || ext === '.aac') mimeType = 'audio/mp4';
+    else if (ext === '.mp4') mimeType = 'video/mp4';
+    else if (ext === '.webm') mimeType = 'video/webm';
+    else if (ext === '.mov') mimeType = 'video/quicktime';
+    else if (ext === '.ogg') mimeType = 'audio/ogg';
 
     return res.json({
       status: 'ok',
@@ -507,7 +513,7 @@ app.post('/api/load-local-audio', (req, res) => {
   }
 });
 
-// Endpoint to stream local audio directly to browser audio player
+// Endpoint to stream local audio/video directly to browser media player with range support
 app.get('/api/stream-audio', (req, res) => {
   try {
     let filePath = String(req.query.path || '').trim();
@@ -525,7 +531,13 @@ app.get('/api/stream-audio', (req, res) => {
     const range = req.headers.range;
 
     const ext = path.extname(filePath).toLowerCase();
-    const contentType = ext === '.wav' ? 'audio/wav' : ext === '.m4a' ? 'audio/m4a' : 'audio/mp3';
+    let contentType = 'audio/mp3';
+    if (ext === '.wav') contentType = 'audio/wav';
+    else if (ext === '.m4a' || ext === '.aac') contentType = 'audio/mp4';
+    else if (ext === '.mp4') contentType = 'video/mp4';
+    else if (ext === '.webm') contentType = 'video/webm';
+    else if (ext === '.mov') contentType = 'video/quicktime';
+    else if (ext === '.ogg') contentType = 'audio/ogg';
 
     if (range) {
       const parts = range.replace(/bytes=/, '').split('-');
@@ -551,6 +563,57 @@ app.get('/api/stream-audio', (req, res) => {
       });
       fs.createReadStream(filePath).pipe(res);
     }
+  } catch (err: any) {
+    res.status(500).send(err.message);
+  }
+});
+
+// High-Quality Khmer Text-to-Speech (TTS) Endpoint
+app.get('/api/tts', async (req, res) => {
+  try {
+    const text = String(req.query.text || '').trim();
+    const gender = String(req.query.gender || 'female').toLowerCase();
+    if (!text) return res.status(400).send('No text provided');
+
+    const voice = (gender === 'male' || gender.includes('ប្រុស'))
+      ? 'km-KH-PisethNeural'
+      : 'km-KH-SreymomNeural';
+    const tmpFile = `/tmp/tts_${Date.now()}_${Math.random().toString(36).slice(2)}.mp3`;
+
+    let generated = false;
+    try {
+      const cleanText = text.replace(/'/g, "\\'");
+      await execPromise(`python3 -c "import asyncio, edge_tts; asyncio.run(edge_tts.Communicate('${cleanText}', '${voice}').save('${tmpFile}'))"`);
+      if (fs.existsSync(tmpFile) && fs.statSync(tmpFile).size > 500) {
+        generated = true;
+      }
+    } catch {}
+
+    if (generated) {
+      res.setHeader('Content-Type', 'audio/mp3');
+      const stream = fs.createReadStream(tmpFile);
+      stream.pipe(res);
+      stream.on('end', () => {
+        try { fs.unlinkSync(tmpFile); } catch {}
+      });
+      return;
+    }
+
+    // High-reliability Cloud Fallback: Google Translate Khmer TTS
+    const gUrl = `https://translate.google.com/translate_tts?ie=UTF-8&q=${encodeURIComponent(text)}&tl=km&client=tw-ob`;
+    const gResp = await fetch(gUrl, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'
+      }
+    });
+    if (gResp.ok) {
+      const buf = await gResp.arrayBuffer();
+      res.setHeader('Content-Type', 'audio/mp3');
+      res.send(Buffer.from(buf));
+      return;
+    }
+
+    res.status(500).send('Failed to generate Khmer speech');
   } catch (err: any) {
     res.status(500).send(err.message);
   }

@@ -11,7 +11,7 @@ from qt_compat import (
     Qt, Signal, Slot, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QFrame, QFileDialog, QTableWidget, QTableWidgetItem, QHeaderView,
     QTextEdit, QLineEdit, QAbstractItemView, QSlider, QCheckBox, QRadioButton, QSpinBox,
-    QDoubleSpinBox, QComboBox, QGroupBox, QScrollArea, QMediaPlayer, QAudioOutput, QProgressBar,
+    QDoubleSpinBox, QComboBox, QGroupBox, QScrollArea, QMediaPlayer, QAudioOutput, QMediaDevices, QProgressBar,
     QUrl, create_media_content, QtGui, QtCore, QScrollBar, QTabWidget, QColorDialog,
     QMenu, QAction, QToolButton, QStyledItemDelegate, QStyleOptionViewItem,
     QDialog, QDialogButtonBox, QMessageBox
@@ -2138,6 +2138,14 @@ class VideoPreviewWidget(QWidget):
         self.player = QMediaPlayer(self)
         self.audio_output = QAudioOutput(self)
         if hasattr(self.player, 'setAudioOutput'):
+            try:
+                def_dev = QMediaDevices.defaultAudioOutput()
+                if def_dev and hasattr(self.audio_output, 'setDevice'):
+                    self.audio_output.setDevice(def_dev)
+            except Exception:
+                pass
+            if hasattr(self.audio_output, 'setMuted'):
+                self.audio_output.setMuted(False)
             self.audio_output.setVolume(1.0)
             self.player.setAudioOutput(self.audio_output)
 

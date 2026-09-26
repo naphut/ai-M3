@@ -17,7 +17,7 @@ try:
         QInputDialog, QScrollBar, QColorDialog, QMenu, QToolButton, QStyledItemDelegate,
         QStyleOptionViewItem, QDialog, QDialogButtonBox
     )
-    from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
+    from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput, QMediaDevices
     from PySide6.QtMultimediaWidgets import QVideoWidget
     IS_PYSIDE6 = True
 
@@ -44,6 +44,13 @@ except ImportError:
     class QAudioOutput:
         def __init__(self, parent=None): pass
         def setVolume(self, v): pass
+        def setMuted(self, m): pass
+        def setDevice(self, d): pass
+
+    class QMediaDevices:
+        @staticmethod
+        def defaultAudioOutput():
+            return None
 
     def create_media_content(url):
         return QMediaContent(url)

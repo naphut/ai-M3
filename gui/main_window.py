@@ -1833,7 +1833,9 @@ class MainWindow(QMainWindow):
 
         # Automatically switch video preview audio track to "🇰🇭 Khmer Dubbed" (index 1) and reload mixed audio
         if hasattr(self.video_preview, 'audio_track_combo'):
+            self.video_preview.audio_track_combo.blockSignals(True)
             self.video_preview.audio_track_combo.setCurrentIndex(1)
+            self.video_preview.audio_track_combo.blockSignals(False)
             if hasattr(self.video_preview, 'reload_mixed_audio'):
                 self.video_preview.reload_mixed_audio()
             else:
