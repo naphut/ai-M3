@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { Film, Copy, Check, Download, Search, CheckCircle2, FileCode, Sparkles } from 'lucide-react';
 import { TranslationResult } from '../types/translator';
 import { exportToSrt, downloadFile, cleanSpeakerTagFromText } from '../utils/subtitles';
+import { sendSubtitlesToDesktopStudio } from '../utils/desktopBridge';
 
 interface SrtCodeViewProps {
   result: TranslationResult;
@@ -40,12 +41,8 @@ export const SrtCodeView: React.FC<SrtCodeViewProps> = ({
         translatedText: cleanSpeakerTagFromText(s.translatedText),
         sourceText: cleanSpeakerTagFromText(s.sourceText),
       }));
-      const res = await fetch('/api/export-to-studio', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ srtText: srtContent, segments: cleanSegments }),
-      });
-      if (res.ok) {
+      const ok = await sendSubtitlesToDesktopStudio(srtContent, cleanSegments);
+      if (ok) {
         setStudioExportSuccess(true);
         setTimeout(() => setStudioExportSuccess(false), 3000);
       }

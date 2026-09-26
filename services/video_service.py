@@ -89,7 +89,8 @@ class VideoService:
             filter_str = (
                 f"[2:a]volume={bg_vol_str}[bgm_scaled];"
                 f"[bgm_scaled][1:a]sidechaincompress=threshold=0.035:ratio=3.5:attack=35:release=280[ducked_bgm];"
-                f"[1:a][ducked_bgm]amix=inputs=2:duration=first:dropout_transition=1,alimiter=limit=0.98[aout]"
+                f"[1:a]volume=1.45[v_boost];"
+                f"[v_boost][ducked_bgm]amix=inputs=2:duration=longest:dropout_transition=0,alimiter=limit=0.99[aout]"
             )
             cmd = [
                 "ffmpeg", "-y",

@@ -200,9 +200,8 @@ class MainWindow(QMainWindow):
         # Thread-safe logger
         setup_logger(callback=self.log_console.append_log)
 
-        # Background watcher disabled to prevent unexpected subtitle collisions
-        # User imports explicitly via '📋 Paste SRT' button or Cmd+V
-        # self._setup_web_studio_watcher()
+        # Background watcher for seamless auto-sync from Web Studio (localhost & ai.studio)
+        self._setup_web_studio_watcher()
 
         # Global Shortcut for Cmd+V / Ctrl+V to paste Subtitles anywhere
         self.paste_shortcut = QShortcut(QKeySequence("Ctrl+V"), self)
@@ -271,9 +270,16 @@ class MainWindow(QMainWindow):
         self.copy_mp3_btn.setContextMenuPolicy(Qt.CustomContextMenu)
         self.copy_mp3_btn.customContextMenuRequested.connect(self._show_mp3_context_menu)
 
+        self.drag_mp3_btn = QPushButton("📂 Drag to Web", self)
+        self.drag_mp3_btn.setProperty("class", "btn-gray")
+        self.drag_mp3_btn.setToolTip("បើកបង្ហាញ File MP3 ក្នុង Finder ដើម្បីអូសទម្លាក់ (Drag & Drop) ចូលក្នុង Google AI Studio / Web Browser")
+        self.drag_mp3_btn.setEnabled(False)
+        self.drag_mp3_btn.clicked.connect(self._reveal_mp3_in_finder)
+
         wf_lay.addWidget(b1)
         wf_lay.addWidget(self.load_vid_btn)
         wf_lay.addWidget(self.copy_mp3_btn)
+        wf_lay.addWidget(self.drag_mp3_btn)
 
         # Divider
         w_sep1 = QFrame(self)
@@ -287,8 +293,10 @@ class MainWindow(QMainWindow):
 
         self.open_web_ui_btn = QPushButton("🌐 Web Studio", self)
         self.open_web_ui_btn.setProperty("class", "btn-gray")
-        self.open_web_ui_btn.setToolTip("បើក React Web Studio (http://localhost:3000) ក្នុង Browser")
-        self.open_web_ui_btn.clicked.connect(self._open_web_studio)
+        self.open_web_ui_btn.setToolTip("បើក Google AI Studio Web App (https://ai.studio/apps/cba70a44-052d-4127-835e-c868a8c6f4ab)\nRight-click សម្រាប់ជម្រើសបន្ថែម")
+        self.open_web_ui_btn.clicked.connect(lambda: self._open_web_studio())
+        self.open_web_ui_btn.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.open_web_ui_btn.customContextMenuRequested.connect(self._show_web_studio_menu)
 
         self.paste_sub_top_btn = QPushButton("📋 Paste SRT", self)
         self.paste_sub_top_btn.setProperty("class", "btn-purple")
@@ -322,6 +330,7 @@ class MainWindow(QMainWindow):
         tools_menu.addSeparator()
         tools_menu.addAction("🔊 Generate Voices (Dubbing Preview)", self._generate_all_voices)
         tools_menu.addAction("📁 Open Video", self._browse_video)
+        tools_menu.addAction("🌐 Open Google AI Studio App", lambda: self._open_web_studio("https://ai.studio/apps/cba70a44-052d-4127-835e-c868a8c6f4ab"))
         tools_menu.addAction("⚡ Run React Engine Direct", self._run_transcription_only)
         tools_menu.addAction("🔑 Configure Gemini API Key", self._open_gemini_settings)
         tools_menu.addAction("🧹 Clear Cache & Temp Files", self._clear_temp_cache)
@@ -874,6 +883,10 @@ class MainWindow(QMainWindow):
         self.copy_mp3_btn.setText("📋 Copy MP3")
         self.copy_mp3_btn.setToolTip(f"MP3 Ready ({size_mb:.1f} MB)\n{mp3_path}\nClick to copy MP3 file to clipboard!")
         
+        if hasattr(self, 'drag_mp3_btn'):
+            self.drag_mp3_btn.setEnabled(True)
+            self.drag_mp3_btn.setToolTip(f"Drag '{os.path.basename(mp3_path)}' directly into Web Browser / Google AI Studio")
+
         if hasattr(self, 'copy_mp3_btn_bot'):
             self.copy_mp3_btn_bot.setEnabled(True)
             self.copy_mp3_btn_bot.setText("📋 Copy MP3")
@@ -881,7 +894,7 @@ class MainWindow(QMainWindow):
 
         self.status_lbl.setText(f"✅ Video & MP3 Ready: {os.path.basename(mp3_path)}")
         self.log_console.append_log(f"✅ [Auto-MP3] Generated MP3: {mp3_path} ({size_mb:.1f} MB)")
-        self.log_console.append_log("📋 [Auto-MP3] Click '📋 Copy MP3' to paste this audio file into Finder or any application!")
+        self.log_console.append_log("📋 [Auto-MP3] Click '📋 Copy MP3' to paste or '📂 Drag to Web' to drop into Google AI Studio!")
 
     def _copy_mp3_to_clipboard(self):
         """Copy the generated MP3 file and path to clipboard for Finder pasting or external use."""
@@ -898,17 +911,20 @@ class MainWindow(QMainWindow):
         mime_data.setText(mp3_path)
         clipboard.setMimeData(mime_data)
 
+        # Automatically reveal in Finder so the user can immediately Drag & Drop into Google AI Studio!
+        self._reveal_mp3_in_finder()
+
         # Visual feedback on buttons
-        self.copy_mp3_btn.setText("✅ Copied!")
+        self.copy_mp3_btn.setText("✅ Copied & Opened!")
         if hasattr(self, 'copy_mp3_btn_bot'):
-            self.copy_mp3_btn_bot.setText("✅ Copied!")
+            self.copy_mp3_btn_bot.setText("✅ Copied & Opened!")
         QTimer.singleShot(2500, lambda: (
             getattr(self, 'copy_mp3_btn', None) and self.copy_mp3_btn.setText("📋 Copy MP3"),
             getattr(self, 'copy_mp3_btn_bot', None) and self.copy_mp3_btn_bot.setText("📋 Copy MP3")
         ))
 
-        self.log_console.append_log(f"📋 [Clipboard] Copied MP3 to clipboard: {os.path.basename(mp3_path)}")
-        self.status_lbl.setText(f"📋 Copied MP3: {os.path.basename(mp3_path)} (Paste anywhere via Cmd+V)")
+        self.log_console.append_log(f"📋 [Clipboard] Copied MP3: {os.path.basename(mp3_path)} (Finder opened: You can Drag & Drop it into Google AI Studio)")
+        self.status_lbl.setText(f"📋 Copied MP3 & opened Finder! (Drag & Drop into Google AI Studio or Paste into Local Web)")
 
     def _show_mp3_context_menu(self, pos):
         """Right-click context menu for MP3 actions."""
@@ -1144,24 +1160,47 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(0)
         self._start_react_translation_worker()
 
-    def _open_web_studio(self):
+    def _open_web_studio(self, url=None):
+        """Open Google AI Studio Web App or Local Web Studio in browser."""
+        target_url = url or "https://ai.studio/apps/cba70a44-052d-4127-835e-c868a8c6f4ab"
+        self.status_lbl.setText("🌐 Opening Web Studio in browser...")
+        self.log_console.append_log(f"🌐 Opening Web Studio in browser: {target_url}")
+
+        # Ensure background local bridge (:3000) is running so the Web App on ai.studio can auto-fetch MP3s and export SRTs!
+        try:
+            from services.react_translator_bridge import ReactTranslatorBridge
+            bridge = ReactTranslatorBridge()
+            if not bridge.is_server_running():
+                import threading
+                threading.Thread(target=bridge.ensure_server_running, daemon=True).start()
+        except Exception as e:
+            pass
+
+        opened = QDesktopServices.openUrl(QUrl(target_url))
+        if not opened:
+            import webbrowser
+            webbrowser.open(target_url)
+        self.status_lbl.setText("🌐 Web Studio opened in browser.")
+
+    def _show_web_studio_menu(self, pos):
+        """Right click menu on Web Studio button."""
+        menu = QMenu(self)
+        menu.addAction("🌐 Open Google AI Studio App (Cloud)", lambda: self._open_web_studio("https://ai.studio/apps/cba70a44-052d-4127-835e-c868a8c6f4ab"))
+        menu.addAction("💻 Open Local Web Studio (http://localhost:3000)", self._open_local_web_studio)
+        menu.exec_(self.open_web_ui_btn.mapToGlobal(pos))
+
+    def _open_local_web_studio(self):
         """Ensure React server is online and open http://localhost:3000 in browser."""
         from services.react_translator_bridge import ReactTranslatorBridge
         bridge = ReactTranslatorBridge()
-        self.status_lbl.setText("🌐 Connecting to Web Studio (:3000)...")
+        self.status_lbl.setText("🌐 Connecting to Local Web Studio (:3000)...")
         QApplication.processEvents()
 
         if not bridge.is_server_running():
-            self.log_console.append_log("🌐 Launching Web Studio server in background...")
+            self.log_console.append_log("🌐 Launching Local Web Studio server in background...")
             bridge.ensure_server_running()
 
-        url = "http://localhost:3000"
-        self.log_console.append_log(f"🌐 Opening Web Studio in browser: {url}")
-        opened = QDesktopServices.openUrl(QUrl(url))
-        if not opened:
-            import webbrowser
-            webbrowser.open(url)
-        self.status_lbl.setText("🌐 Web Studio opened in browser.")
+        self._open_web_studio("http://localhost:3000")
 
     def _start_react_translation_worker(self, on_finish_callback=None):
         """Dedicated worker using ReactTranslatorBridge (:3000) for instant Khmer SRT."""
@@ -1831,25 +1870,41 @@ class MainWindow(QMainWindow):
         self.status_lbl.setText("✅ Khmer voices ready! Switched to Khmer Dubbed Audio.")
         self.log_console.append_log(f"✅ [VoiceGen] Khmer dubbed track generated: {os.path.basename(master_wav)}")
 
-        # Automatically switch video preview audio track to "🇰🇭 Khmer Dubbed" (index 1) and reload mixed audio
+        # Automatically switch video preview audio track to "🇰🇭 Khmer Dubbed" (index 1) and reload mixed audio safely
         if hasattr(self.video_preview, 'audio_track_combo'):
             self.video_preview.audio_track_combo.blockSignals(True)
             self.video_preview.audio_track_combo.setCurrentIndex(1)
             self.video_preview.audio_track_combo.blockSignals(False)
-            if hasattr(self.video_preview, 'reload_mixed_audio'):
-                self.video_preview.reload_mixed_audio()
-            else:
-                self.video_preview._load_audio_for_player()
+
+        if hasattr(self.video_preview, 'reload_mixed_audio'):
+            self.video_preview.reload_mixed_audio()
+        elif hasattr(self.video_preview, '_load_audio_for_player'):
+            self.video_preview._load_audio_for_player()
+
+        # Ensure preview player audio output is completely unmuted & volume 100%
+        if hasattr(self.video_preview, 'audio_output'):
+            if hasattr(self.video_preview.audio_output, 'setMuted'):
+                self.video_preview.audio_output.setMuted(False)
+            if hasattr(self.video_preview.audio_output, 'setVolume'):
+                self.video_preview.audio_output.setVolume(1.0)
 
         # Trigger background auto-save so user never loses generated audio state
         self._auto_save_project()
 
-        QMessageBox.information(
-            self, "Voice Generation Complete",
+        msg_box = QMessageBox(self)
+        msg_box.setWindowTitle("Voice Generation Complete")
+        msg_box.setIcon(QMessageBox.Icon.Information if hasattr(QMessageBox, 'Icon') else QMessageBox.Information)
+        msg_box.setText(
             f"✅ សំយោគសំឡេងខ្មែរគ្រប់ជួរ ({len(self.subtitle_table.get_updated_segments())} ឃ្លា) បានជោគជ័យ!\n\n"
-            "ប្រព័ន្ធបានប្តូរទៅចាក់សំឡេង '🇰🇭 Khmer Dubbed' ដោយស្វ័យប្រវត្តិ។\n"
+            "ប្រព័ន្ធបានប្តូរទៅចាក់សំឡេង '🇰🇭 Khmer Dubbed' រួចជាស្រេច។\n"
             "លោកអ្នកអាចចុច Play (Space) លើវីដេអូដើម្បីស្តាប់សាកល្បងបានភ្លាមៗ!"
         )
+        play_btn = msg_box.addButton("▶ ចាក់ស្តាប់ភ្លាមៗ (Play Preview)", QMessageBox.ButtonRole.AcceptRole if hasattr(QMessageBox, 'ButtonRole') else QMessageBox.AcceptRole)
+        close_btn = msg_box.addButton("យល់ព្រម (OK)", QMessageBox.ButtonRole.RejectRole if hasattr(QMessageBox, 'ButtonRole') else QMessageBox.RejectRole)
+        msg_box.exec()
+        if msg_box.clickedButton() == play_btn:
+            if hasattr(self.video_preview, '_toggle_play') and not self.video_preview._is_playing:
+                self.video_preview._toggle_play()
 
     def _on_voice_gen_error(self, err_msg: str):
         if hasattr(self.subtitle_table, 'generate_voices_btn'):

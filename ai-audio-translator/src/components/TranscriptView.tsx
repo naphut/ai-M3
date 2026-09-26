@@ -1,4 +1,4 @@
-import React, { useState, useRef } from 'react';
+import React, { useState } from 'react';
 import {
   Play,
   Copy,
@@ -14,7 +14,6 @@ import {
   Save,
   X,
   Languages,
-  Loader2,
 } from 'lucide-react';
 import { Segment, TranslationResult, PERSONA_OPTIONS, EMOTION_OPTIONS, STYLE_OPTIONS } from '../types/translator';
 import { formatTimeDisplay, exportToSrt } from '../utils/subtitles';
@@ -116,47 +115,15 @@ export const TranscriptView: React.FC<TranscriptViewProps> = ({
     setEditingId(null);
   };
 
-  // Active playing audio state
-  const [playingId, setPlayingId] = useState<number | null>(null);
-  const audioPlayerRef = useRef<HTMLAudioElement | null>(null);
-
-  // High-quality Khmer Text-to-Speech (TTS) playback using /api/tts with Google TTS fallback
-  const speakText = (seg: Segment) => {
-    const text = (seg.translatedText || '').trim();
-    if (!text) return;
-
-    if (audioPlayerRef.current) {
-      audioPlayerRef.current.pause();
-      audioPlayerRef.current = null;
+  // Text to speech for the segment using browser speech synthesis
+  const speakText = (text: string, langHint: string = 'km-KH') => {
+    if ('speechSynthesis' in window) {
+      window.speechSynthesis.cancel();
+      const utterance = new SpeechSynthesisUtterance(text);
+      utterance.lang = langHint;
+      utterance.rate = 0.95;
+      window.speechSynthesis.speak(utterance);
     }
-
-    setPlayingId(seg.id);
-    const gender = (seg.gender || 'female').toLowerCase();
-    const ttsUrl = `/api/tts?text=${encodeURIComponent(text)}&gender=${encodeURIComponent(gender)}`;
-
-    const audio = new Audio(ttsUrl);
-    audioPlayerRef.current = audio;
-
-    audio.onended = () => {
-      setPlayingId(null);
-      audioPlayerRef.current = null;
-    };
-
-    audio.onerror = () => {
-      // Fallback directly to Google Translate Khmer TTS
-      const fallbackUrl = `https://translate.google.com/translate_tts?ie=UTF-8&q=${encodeURIComponent(text)}&tl=km&client=tw-ob`;
-      const fallbackAudio = new Audio(fallbackUrl);
-      audioPlayerRef.current = fallbackAudio;
-      fallbackAudio.onended = () => {
-        setPlayingId(null);
-        audioPlayerRef.current = null;
-      };
-      fallbackAudio.play().catch(() => setPlayingId(null));
-    };
-
-    audio.play().catch(() => {
-      setPlayingId(null);
-    });
   };
 
   const filteredSegments = result.segments.filter((seg) => {
@@ -437,19 +404,11 @@ export const TranscriptView: React.FC<TranscriptViewProps> = ({
                   <div className="flex items-center gap-1 opacity-80 group-hover:opacity-100 transition">
                     <button
                       type="button"
-                      onClick={() => speakText(seg)}
-                      className={`p-1.5 rounded-lg transition cursor-pointer ${
-                        playingId === seg.id
-                          ? 'text-amber-300 bg-amber-500/20 ring-1 ring-amber-400/50'
-                          : 'text-slate-400 hover:text-amber-400 hover:bg-slate-800'
-                      }`}
+                      onClick={() => speakText(seg.translatedText, 'km-KH')}
+                      className="p-1.5 text-slate-400 hover:text-amber-400 hover:bg-slate-800 rounded-lg transition cursor-pointer"
                       title="ស្តាប់សំឡេងអានភាសាខ្មែរ (TTS)"
                     >
-                      {playingId === seg.id ? (
-                        <Loader2 className="w-3.5 h-3.5 animate-spin text-amber-400" />
-                      ) : (
-                        <Volume2 className="w-3.5 h-3.5" />
-                      )}
+                      <Volume2 className="w-3.5 h-3.5" />
                     </button>
 
                     {!isEditing && (
@@ -537,19 +496,11 @@ export const TranscriptView: React.FC<TranscriptViewProps> = ({
                         <div className="flex items-center gap-1.5">
                           <button
                             type="button"
-                            onClick={() => speakText(seg)}
-                            className={`text-[10px] flex items-center gap-0.5 cursor-pointer p-0.5 rounded ${
-                              playingId === seg.id
-                                ? 'text-amber-300 bg-amber-500/20'
-                                : 'text-amber-400/80 hover:text-amber-300'
-                            }`}
+                            onClick={() => speakText(seg.translatedText, 'km-KH')}
+                            className="text-[10px] text-amber-400/80 hover:text-amber-300 flex items-center gap-0.5 cursor-pointer"
                             title="ស្តាប់សំឡេង"
                           >
-                            {playingId === seg.id ? (
-                              <Loader2 className="w-3 h-3 animate-spin text-amber-400" />
-                            ) : (
-                              <Volume2 className="w-3 h-3" />
-                            )}
+                            <Volume2 className="w-3 h-3" />
                           </button>
                           <button
                             type="button"

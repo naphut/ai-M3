@@ -16,6 +16,12 @@ import { GenerationPipelineBanner } from './components/GenerationPipelineBanner'
 import { SrtCodeView } from './components/SrtCodeView';
 import { AudioFileState, QueueItem, TranslationResult } from './types/translator';
 import { Film, Info, AlertCircle, RefreshCw, FileText, CheckCircle2, Loader2 } from 'lucide-react';
+import {
+  loadLocalAudioFilePath,
+  isRunningLocally,
+  LOCAL_SERVER_BASE,
+  pingLocalServer,
+} from './utils/desktopBridge';
 
 export default function App() {
   const [queue, setQueue] = useState<QueueItem[]>([]);
@@ -133,30 +139,21 @@ export default function App() {
       ) {
         e.preventDefault();
         try {
-          const res = await fetch('/api/load-local-audio', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ filePath: pastedText }),
-          });
-          if (res.ok) {
-            const data = await res.json();
-            if (data.status === 'ok') {
-              const item: AudioFileState = {
-                file: null,
-                name: data.name,
-                size: data.size,
-                duration: 0,
-                objectUrl: data.streamUrl,
-                base64: '',
-                mimeType: data.mimeType,
-                localFilePath: data.filePath,
-              };
-              handleAudiosAdded([item], true);
-              return;
-            }
-          }
+          const loaded = await loadLocalAudioFilePath(pastedText);
+          const item: AudioFileState = {
+            file: loaded.file,
+            name: loaded.name,
+            size: loaded.size,
+            duration: 0,
+            objectUrl: loaded.objectUrl,
+            base64: '',
+            mimeType: loaded.file.type || 'audio/mp3',
+            localFilePath: loaded.filePath,
+          };
+          handleAudiosAdded([item], true);
+          return;
         } catch (err) {
-          console.warn('[Paste] Could not resolve local file path:', err);
+          console.warn('[Paste] Could not resolve local file path via bridge:', err);
         }
       }
     };
@@ -213,9 +210,11 @@ export default function App() {
       );
 
       try {
+        const isLocalOnline = !isRunningLocally() ? await pingLocalServer() : false;
+        const apiBase = isLocalOnline ? LOCAL_SERVER_BASE : '';
         const data: TranslationResult = await new Promise((resolve, reject) => {
           const xhr = new XMLHttpRequest();
-          xhr.open('POST', '/api/translate-audio');
+          xhr.open('POST', `${apiBase}/api/translate-audio`);
 
           // Track accurate real upload progress
           xhr.upload.onprogress = (event) => {

@@ -11,7 +11,7 @@ from qt_compat import (
     Qt, Signal, Slot, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QFrame, QFileDialog, QTableWidget, QTableWidgetItem, QHeaderView,
     QTextEdit, QLineEdit, QAbstractItemView, QSlider, QCheckBox, QRadioButton, QSpinBox,
-    QDoubleSpinBox, QComboBox, QGroupBox, QScrollArea, QMediaPlayer, QAudioOutput, QMediaDevices, QProgressBar,
+    QDoubleSpinBox, QComboBox, QGroupBox, QScrollArea, QMediaPlayer, QAudioOutput, QProgressBar,
     QUrl, create_media_content, QtGui, QtCore, QScrollBar, QTabWidget, QColorDialog,
     QMenu, QAction, QToolButton, QStyledItemDelegate, QStyleOptionViewItem,
     QDialog, QDialogButtonBox, QMessageBox
@@ -1662,10 +1662,17 @@ class SubtitleTableWidget(QWidget):
         out_wav = tts.synthesize_single_line(seg, row)
         if out_wav and os.path.exists(out_wav):
             try:
+                # Stop any previous line preview to avoid overlapping audio
+                if hasattr(self, '_preview_proc') and self._preview_proc and self._preview_proc.poll() is None:
+                    try:
+                        self._preview_proc.terminate()
+                    except Exception:
+                        pass
+
                 if sys.platform == "darwin":
-                    subprocess.Popen(["afplay", out_wav])
+                    self._preview_proc = subprocess.Popen(["afplay", "-v", "1", out_wav])
                 else:
-                    subprocess.Popen(["xdg-open" if sys.platform != "win32" else "start", out_wav], shell=True)
+                    self._preview_proc = subprocess.Popen(["xdg-open" if sys.platform != "win32" else "start", out_wav], shell=True)
             except Exception as e:
                 logger.error(f"Playback error: {e}")
 
@@ -1771,10 +1778,16 @@ class SubtitleTableWidget(QWidget):
                 scene_wav = final_scene_wav
 
         try:
+            if hasattr(self, '_preview_proc') and self._preview_proc and self._preview_proc.poll() is None:
+                try:
+                    self._preview_proc.terminate()
+                except Exception:
+                    pass
+
             if sys.platform == "darwin":
-                subprocess.Popen(["afplay", scene_wav])
+                self._preview_proc = subprocess.Popen(["afplay", "-v", "1", scene_wav])
             else:
-                subprocess.Popen(["xdg-open" if sys.platform != "win32" else "start", scene_wav], shell=True)
+                self._preview_proc = subprocess.Popen(["xdg-open" if sys.platform != "win32" else "start", scene_wav], shell=True)
         except Exception as e:
             logger.error(f"Scene playback error: {e}")
 
@@ -2137,17 +2150,22 @@ class VideoPreviewWidget(QWidget):
         
         self.player = QMediaPlayer(self)
         self.audio_output = QAudioOutput(self)
+        self._pending_audio_pos_ms = None
+        self._pending_play = False
+        try:
+            from PySide6.QtMultimedia import QMediaDevices
+            def_dev = QMediaDevices.defaultAudioOutput()
+            if def_dev and not def_dev.isNull():
+                self.audio_output.setDevice(def_dev)
+        except Exception:
+            pass
         if hasattr(self.player, 'setAudioOutput'):
-            try:
-                def_dev = QMediaDevices.defaultAudioOutput()
-                if def_dev and hasattr(self.audio_output, 'setDevice'):
-                    self.audio_output.setDevice(def_dev)
-            except Exception:
-                pass
+            self.audio_output.setVolume(1.0)
             if hasattr(self.audio_output, 'setMuted'):
                 self.audio_output.setMuted(False)
-            self.audio_output.setVolume(1.0)
             self.player.setAudioOutput(self.audio_output)
+        if hasattr(self.player, 'mediaStatusChanged'):
+            self.player.mediaStatusChanged.connect(self._on_media_status_changed)
 
         self._init_ui()
 
@@ -2227,13 +2245,35 @@ class VideoPreviewWidget(QWidget):
         if hasattr(self, 'audio_output') and hasattr(self.audio_output, 'setVolume'):
             self.audio_output.setVolume(val / 100.0)
 
+    def _on_media_status_changed(self, status):
+        try:
+            from PySide6.QtMultimedia import QMediaPlayer
+            if status in [QMediaPlayer.MediaStatus.LoadedMedia, QMediaPlayer.MediaStatus.BufferedMedia]:
+                if hasattr(self, '_pending_audio_pos_ms') and self._pending_audio_pos_ms is not None:
+                    self.player.setPosition(self._pending_audio_pos_ms)
+                    self._pending_audio_pos_ms = None
+                if getattr(self, '_pending_play', False) or (self._is_playing and self.player.playbackState() != QMediaPlayer.PlaybackState.PlayingState):
+                    self._pending_play = False
+                    if hasattr(self, 'audio_output'):
+                        if hasattr(self.audio_output, 'setMuted'):
+                            self.audio_output.setMuted(False)
+                        vol = self.vol_slider.value() / 100.0 if hasattr(self, 'vol_slider') else 1.0
+                        self.audio_output.setVolume(vol)
+                    self.player.play()
+                    logger.info("🔊 [VideoPreview] Audio playback resumed from LoadedMedia status.")
+        except Exception as e:
+            logger.debug(f"Media status changed handler: {e}")
+
     def _on_audio_track_changed(self, index=0):
         was_playing = self._is_playing
         pos_ms = int((self.current_frame / max(1.0, self.fps)) * 1000)
+        self._pending_audio_pos_ms = pos_ms
         self._load_audio_for_player()
         try:
             self.player.setPosition(pos_ms)
             if was_playing:
+                if hasattr(self, 'audio_output') and hasattr(self.audio_output, 'setMuted'):
+                    self.audio_output.setMuted(False)
                 self.player.play()
         except Exception:
             pass
@@ -2260,11 +2300,14 @@ class VideoPreviewWidget(QWidget):
             return
         was_playing = self._is_playing
         pos_ms = int((self.current_frame / max(1.0, self.fps)) * 1000)
+        self._pending_audio_pos_ms = pos_ms
         self._load_audio_for_player()
         if hasattr(self, 'player'):
             try:
                 self.player.setPosition(pos_ms)
                 if was_playing:
+                    if hasattr(self, 'audio_output') and hasattr(self.audio_output, 'setMuted'):
+                        self.audio_output.setMuted(False)
                     self.player.play()
             except Exception:
                 pass
@@ -2275,12 +2318,17 @@ class VideoPreviewWidget(QWidget):
 
         from utils.file_utils import get_temp_path
         use_khmer = (self.audio_track_combo.currentIndex() == 1) if hasattr(self, 'audio_track_combo') else False
-        master_khmer_wav = get_temp_path("master_khmer_voice.wav")
+        
+        main_win = self.window()
+        last_master = getattr(main_win, 'last_master_wav', None)
+        default_master = get_temp_path("master_khmer_voice.wav")
+        if last_master and os.path.exists(last_master) and os.path.getsize(last_master) > 1000:
+            master_khmer_wav = last_master
+        else:
+            master_khmer_wav = default_master
 
         target_audio_file = None
         if use_khmer and os.path.exists(master_khmer_wav) and os.path.getsize(master_khmer_wav) > 1000:
-            # Query current BGM volume from main window
-            main_win = self.window()
             bgm_spin = getattr(main_win, 'bgm_vol_spin', None)
             bgm_vol = (bgm_spin.value() / 100.0) if bgm_spin else 0.35
 
@@ -2301,12 +2349,13 @@ class VideoPreviewWidget(QWidget):
                         duck_speech_db=-45.0
                     )
                     # Overlay master Khmer voice on top of cleaned background track
+                    # Boost Khmer voice volume by 1.45x so dialogue is crisp, loud, and prominent over BGM
                     mixed_wav = get_temp_path("preview_khmer_mixed.wav")
                     cmd_mix = [
                         "ffmpeg", "-y",
                         "-i", master_khmer_wav,
                         "-i", cleaned_bg,
-                        "-filter_complex", "[0:a][1:a]amix=inputs=2:duration=first:dropout_transition=1,alimiter=limit=0.98[aout]",
+                        "-filter_complex", "[0:a]volume=1.45[v0];[1:a]volume=1.0[v1];[v0][v1]amix=inputs=2:duration=longest:dropout_transition=0,alimiter=limit=0.99[aout]",
                         "-map", "[aout]",
                         "-ar", "44100",
                         "-ac", "2",
@@ -3018,8 +3067,13 @@ class VideoPreviewWidget(QWidget):
             self.play_timer.stop()
             self.player.pause()
             self._is_playing = False
+            self._pending_play = False
             self.play_btn.setText("▶ Play")
+            logger.info("⏸ [VideoPreview] Playback paused.")
         else:
+            if hasattr(self.player, 'source') and self.player.source().isEmpty():
+                self._load_audio_for_player()
+
             pos_ms = int((self.current_frame / max(1.0, self.fps)) * 1000)
             try:
                 self.player.setPosition(pos_ms)
@@ -3028,10 +3082,16 @@ class VideoPreviewWidget(QWidget):
             interval = int(1000.0 / max(10.0, self.fps))
             self.play_timer.start(interval)
             try:
-                if hasattr(self, 'audio_output') and hasattr(self.audio_output, 'setVolume'):
-                    vol = self.vol_slider.value() / 100.0 if hasattr(self, 'vol_slider') else 1.0
-                    self.audio_output.setVolume(vol)
+                if hasattr(self, 'audio_output'):
+                    if hasattr(self.audio_output, 'setMuted'):
+                        self.audio_output.setMuted(False)
+                    if hasattr(self.audio_output, 'setVolume'):
+                        vol = self.vol_slider.value() / 100.0 if hasattr(self, 'vol_slider') else 1.0
+                        self.audio_output.setVolume(vol)
                 self.player.play()
+                if self.player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
+                    self._pending_play = True
+                logger.info(f"▶ [VideoPreview] Playback started at {pos_ms/1000.0:.1f}s (Volume: {self.audio_output.volume():.0%})")
             except Exception as e:
                 logger.warning(f"Player play exception: {e}")
             self._is_playing = True
@@ -4825,7 +4885,7 @@ class AIVoiceStudioWidget(QWidget):
                 except Exception: pass
             
             if sys.platform == "darwin":
-                self._proc = subprocess.Popen(["afplay", self.current_audio_path])
+                self._proc = subprocess.Popen(["afplay", "-v", "1", self.current_audio_path])
             elif sys.platform.startswith("linux"):
                 self._proc = subprocess.Popen(["aplay", self.current_audio_path])
 

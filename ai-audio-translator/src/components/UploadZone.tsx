@@ -18,6 +18,11 @@ import {
 } from 'lucide-react';
 import JSZip from 'jszip';
 import { AudioFileState } from '../types/translator';
+import {
+  fetchLatestDesktopMp3File,
+  loadLocalAudioFilePath,
+  isRunningLocally,
+} from '../utils/desktopBridge';
 
 interface UploadZoneProps {
   onAudiosAdded: (audios: AudioFileState[], autoStart?: boolean) => void;
@@ -246,13 +251,19 @@ export const UploadZone: React.FC<UploadZoneProps> = ({
   const [pasteLoading, setPasteLoading] = useState(false);
   const [pasteStatus, setPasteStatus] = useState<string | null>(null);
   const [pasteInputText, setPasteInputText] = useState('');
+  const [detectedFileSuggestion, setDetectedFileSuggestion] = useState<{
+    name: string;
+    path?: string;
+  } | null>(null);
 
   // 1. One-click button: Read system clipboard and paste MP3 file or path
   const handleClipboardPaste = async () => {
     setPasteLoading(true);
     setPasteStatus(null);
+    setDetectedFileSuggestion(null);
+
     try {
-      // Try reading clipboard files if supported
+      // Try reading clipboard binary files if supported
       if (navigator.clipboard && navigator.clipboard.read) {
         try {
           const items = await navigator.clipboard.read();
@@ -261,7 +272,7 @@ export const UploadZone: React.FC<UploadZoneProps> = ({
               if (type.startsWith('audio/') || type.startsWith('video/')) {
                 const blob = await item.getType(type);
                 const file = new File([blob], `Pasted_Audio_${Date.now()}.${type.split('/')[1] || 'mp3'}`, { type });
-                setPasteStatus(`✅ បានទទួល MP3: ${file.name}`);
+                setPasteStatus(`✅ បានទទួល MP3 ពី Clipboard: ${file.name}`);
                 processIncomingFiles([file], true);
                 setPasteLoading(false);
                 return;
@@ -277,27 +288,28 @@ export const UploadZone: React.FC<UploadZoneProps> = ({
       if (navigator.clipboard && navigator.clipboard.readText) {
         const text = (await navigator.clipboard.readText()).trim();
         if (text) {
-          const res = await fetch('/api/load-local-audio', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ filePath: text }),
-          });
-          const data = await res.json();
-          if (res.ok && data.status === 'ok') {
+          try {
+            const loaded = await loadLocalAudioFilePath(text);
             const newItem: AudioFileState = {
-              file: null,
-              name: data.name,
-              size: data.size,
+              file: loaded.file,
+              name: loaded.name,
+              size: loaded.size,
               duration: 0,
-              objectUrl: data.streamUrl,
+              objectUrl: loaded.objectUrl,
               base64: '',
-              mimeType: data.mimeType,
-              localFilePath: data.filePath,
+              mimeType: loaded.file.type || 'audio/mp3',
+              localFilePath: loaded.filePath,
             };
-            setPasteStatus(`✅ បានទទួល MP3: ${data.name} (${(data.size / (1024 * 1024)).toFixed(1)} MB)`);
+            setPasteStatus(`✅ បានទទួល MP3: ${loaded.name} (${(loaded.size / (1024 * 1024)).toFixed(1)} MB)`);
             onAudiosAdded([newItem], true);
             setPasteLoading(false);
             return;
+          } catch (loadErr) {
+            console.warn('[Clipboard.readText] Local path load warning:', loadErr);
+            const possibleFileName = text.split(/[/\\]/).pop();
+            if (possibleFileName && AUDIO_EXTENSIONS.test(possibleFileName)) {
+              setDetectedFileSuggestion({ name: possibleFileName, path: text });
+            }
           }
         }
       }
@@ -305,7 +317,7 @@ export const UploadZone: React.FC<UploadZoneProps> = ({
       // Fallback: Fetch newest MP3 generated in Desktop Studio
       await handleFetchLatestDesktopMp3();
     } catch (err: any) {
-      setPasteStatus(`⚠️ សូមចុចក្នុងប្រអប់ខាងក្រោម រួចចុច Cmd+V: ${err.message}`);
+      setPasteStatus(`⚠️ ${err.message || 'សូមចុចក្នុងប្រអប់ខាងក្រោម រួចចុច Cmd+V'}`);
     } finally {
       setPasteLoading(false);
     }
@@ -314,28 +326,26 @@ export const UploadZone: React.FC<UploadZoneProps> = ({
   // 2. One-click button: Auto-fetch latest MP3 from Desktop Studio
   const handleFetchLatestDesktopMp3 = async () => {
     setPasteLoading(true);
-    setPasteStatus('កំពុងស្វែងរក MP3 ថ្មីពី Desktop Studio...');
+    setPasteStatus('កំពុងភ្ជាប់ទៅ Desktop Studio ដើម្បីទាញយក MP3...');
+    setDetectedFileSuggestion(null);
+
     try {
-      const res = await fetch('/api/latest-desktop-mp3');
-      const data = await res.json();
-      if (res.ok && data.status === 'ok') {
-        const newItem: AudioFileState = {
-          file: null,
-          name: data.name,
-          size: data.size,
-          duration: 0,
-          objectUrl: data.streamUrl,
-          base64: '',
-          mimeType: 'audio/mp3',
-          localFilePath: data.filePath,
-        };
-        setPasteStatus(`✅ បានទាញយក MP3 ពី Desktop: ${data.name} (${(data.size / (1024 * 1024)).toFixed(1)} MB)`);
-        onAudiosAdded([newItem], true);
-      } else {
-        setPasteStatus(`⚠️ ${data.error || 'រកមិនឃើញ File MP3 ថ្មីក្នុង Desktop ឡើយ'}`);
-      }
+      const loaded = await fetchLatestDesktopMp3File();
+      const newItem: AudioFileState = {
+        file: loaded.file,
+        name: loaded.name,
+        size: loaded.size,
+        duration: 0,
+        objectUrl: loaded.objectUrl,
+        base64: '',
+        mimeType: loaded.file.type || 'audio/mp3',
+        localFilePath: loaded.filePath,
+      };
+
+      setPasteStatus(`✅ បានទាញយក MP3 ពី Desktop Studio: ${loaded.name} (${(loaded.size / (1024 * 1024)).toFixed(1)} MB)`);
+      onAudiosAdded([newItem], true);
     } catch (err: any) {
-      setPasteStatus(`⚠️ បរាជ័យក្នុងការទាញយក MP3: ${err.message}`);
+      setPasteStatus(`💡 ${err.message || 'រកមិនឃើញ File MP3 ថ្មីក្នុង Desktop Studio ឡើយ'}`);
     } finally {
       setPasteLoading(false);
     }
@@ -359,31 +369,31 @@ export const UploadZone: React.FC<UploadZoneProps> = ({
       e.preventDefault();
       setPasteInputText(pastedText);
       setPasteLoading(true);
+      setDetectedFileSuggestion(null);
+
       try {
-        const res = await fetch('/api/load-local-audio', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ filePath: pastedText }),
-        });
-        const data = await res.json();
-        if (res.ok && data.status === 'ok') {
-          const newItem: AudioFileState = {
-            file: null,
-            name: data.name,
-            size: data.size,
-            duration: 0,
-            objectUrl: data.streamUrl,
-            base64: '',
-            mimeType: data.mimeType,
-            localFilePath: data.filePath,
-          };
-          setPasteStatus(`✅ បានទទួល MP3: ${data.name} (${(data.size / (1024 * 1024)).toFixed(1)} MB)`);
-          onAudiosAdded([newItem], true);
-        } else {
-          setPasteStatus(`⚠️ រកមិនឃើញឯកសារ: ${pastedText}`);
-        }
+        const loaded = await loadLocalAudioFilePath(pastedText);
+        const newItem: AudioFileState = {
+          file: loaded.file,
+          name: loaded.name,
+          size: loaded.size,
+          duration: 0,
+          objectUrl: loaded.objectUrl,
+          base64: '',
+          mimeType: loaded.file.type || 'audio/mp3',
+          localFilePath: loaded.filePath,
+        };
+        setPasteStatus(`✅ បានទទួល MP3: ${loaded.name} (${(loaded.size / (1024 * 1024)).toFixed(1)} MB)`);
+        onAudiosAdded([newItem], true);
       } catch (err: any) {
-        setPasteStatus(`⚠️ កំហុស: ${err.message}`);
+        console.warn('Direct paste error:', err);
+        const fileName = pastedText.split(/[/\\]/).pop() || pastedText;
+        if (AUDIO_EXTENSIONS.test(fileName)) {
+          setDetectedFileSuggestion({ name: fileName, path: pastedText });
+          setPasteStatus(`💡 បានរកឃើញឈ្មោះឯកសារ: ${fileName}`);
+        } else {
+          setPasteStatus(`⚠️ មិនអាចបើកឯកសារនេះបានទេ៖ ${err.message}`);
+        }
       } finally {
         setPasteLoading(false);
       }
@@ -653,6 +663,31 @@ export const UploadZone: React.FC<UploadZoneProps> = ({
                 <div className="mt-2.5 flex items-center gap-2 text-xs text-cyan-300 bg-cyan-950/60 border border-cyan-500/30 px-3 py-1.5 rounded-lg">
                   <CheckCircle2 className="w-3.5 h-3.5 text-cyan-400 shrink-0" />
                   <span>{pasteStatus}</span>
+                </div>
+              )}
+
+              {/* Detected Local File Suggestion Card */}
+              {detectedFileSuggestion && (
+                <div className="mt-3 p-3 rounded-xl bg-amber-500/10 border border-amber-500/30 text-left">
+                  <div className="flex items-center gap-2">
+                    <span className="text-base">📄</span>
+                    <div>
+                      <p className="text-xs font-bold text-amber-300">
+                        បានរកឃើញឯកសារ៖ {detectedFileSuggestion.name}
+                      </p>
+                      <p className="text-[11px] text-slate-300 mt-0.5">
+                        ដោយសារសុវត្ថិភាព Browser សូមចុចប៊ូតុងខាងក្រោម ឬ Drag & Drop ពី Finder ចូលក្នុងប្រអប់នេះ៖
+                      </p>
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => fileInputRef.current?.click()}
+                    className="mt-2.5 w-full py-2 px-3 rounded-lg bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold text-xs flex items-center justify-center gap-1.5 transition active:scale-95 shadow cursor-pointer"
+                  >
+                    <FileAudio className="w-3.5 h-3.5" />
+                    <span>📁 ចុចត្រង់នេះដើម្បីជ្រើសរើស "{detectedFileSuggestion.name}"</span>
+                  </button>
                 </div>
               )}
             </div>

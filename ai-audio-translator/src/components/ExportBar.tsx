@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { Download, FileText, Code2, Film, Check, Eye, Copy, Sparkles } from 'lucide-react';
 import { TranslationResult } from '../types/translator';
 import { exportToSrt, exportToVtt, exportToTxt, exportToJson, downloadFile } from '../utils/subtitles';
+import { sendSubtitlesToDesktopStudio } from '../utils/desktopBridge';
 
 interface ExportBarProps {
   result: TranslationResult;
@@ -49,12 +50,8 @@ export const ExportBar: React.FC<ExportBarProps> = ({ result, fileName = 'audio_
     setIsExportingToStudio(true);
     try {
       const srt = exportToSrt(result.segments, 'translated');
-      const res = await fetch('/api/export-to-studio', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ srtText: srt, segments: result.segments }),
-      });
-      if (res.ok) {
+      const ok = await sendSubtitlesToDesktopStudio(srt, result.segments);
+      if (ok) {
         setStudioExportSuccess(true);
         setTimeout(() => setStudioExportSuccess(false), 3000);
       }
