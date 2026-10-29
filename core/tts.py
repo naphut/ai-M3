@@ -171,23 +171,28 @@ class TextToSpeech:
         end = float(segment.get("end", start + 2.5))
         target_duration = max(0.5, round(end - start, 2))
         
-        # Use voice from segment if available, otherwise infer from persona or gender
+        # Use voice from segment if available, otherwise infer from persona, speaker_tag, or gender
         voice_name = segment.get("voice_id") or segment.get("voice")
         persona = segment.get("persona", "")
-        gender = (segment.get("gender") or "").lower()
+        gender = (segment.get("gender") or segment.get("speaker_role") or "").lower()
+        speaker_tag = str(segment.get("speaker_tag") or "").lower()
+        raw_text_check = str(segment.get("khmer_text") or segment.get("text") or "").lower()
+        combined_tag = f"{speaker_tag} {raw_text_check}"
 
         from core.models import PERSONA_DEFAULT_VOICE
-        if not voice_name or voice_name not in VOICE_PRESETS or (voice_name == self.default_voice and (persona or gender)):
-            if persona in PERSONA_DEFAULT_VOICE:
-                voice_name = PERSONA_DEFAULT_VOICE[persona]
-            elif gender in ("female", "ស្រី"):
+        if not voice_name or voice_name not in VOICE_PRESETS or (voice_name == self.default_voice and (persona or gender or combined_tag)):
+            if "[ស្រី]" in combined_tag or gender in ("female", "ស្រី"):
                 voice_name = "Khmer Female - Sreymom"
-            elif gender in ("child", "ក្មេង"):
+            elif "[ក្មេង]" in combined_tag or gender in ("child", "ក្មេង"):
                 voice_name = "Khmer Child - Boy (Vannak)"
-            elif gender in ("elder_female", "ចាស់ស្រី"):
+            elif "[ចាស់ស្រី]" in combined_tag or gender in ("elder_female", "ចាស់ស្រី"):
                 voice_name = "Khmer Elder - Female (Grandmother)"
-            elif gender in ("elder_male", "ចាស់ប្រុស", "elder", "ចាស់", "មនុស្សចាស់"):
+            elif "[ចាស់ប្រុស]" in combined_tag or "[ចាស់]" in combined_tag or gender in ("elder_male", "ចាស់ប្រុស", "elder", "ចាស់", "មនុស្សចាស់"):
                 voice_name = "Khmer Elder - Male (Grandfather)"
+            elif persona in PERSONA_DEFAULT_VOICE:
+                voice_name = PERSONA_DEFAULT_VOICE[persona]
+            elif "[ប្រុស]" in combined_tag or gender in ("male", "ប្រុស"):
+                voice_name = "Khmer Male - Piseth"
             elif voice_name not in VOICE_PRESETS:
                 voice_name = self.default_voice
 
@@ -310,12 +315,12 @@ class TextToSpeech:
         self,
         segments: List[dict],
         progress_callback: Optional[Callable[[int, int, str], None]] = None,
-        max_workers: int = 2,
+        max_workers: int = 6,
         is_cancelled_fn: Optional[Callable[[], bool]] = None
     ) -> List[Optional[str]]:
         """
         Synthesize audio for all segments with:
-        - Bounded concurrency (default max_workers=2) to avoid socket disconnects
+        - Bounded concurrency (default max_workers=6) for optimal throughput on Apple Silicon M2
         - Smart cache verification (instant return for existing valid audio)
         - Automatic sequential recovery pass for any segment that failed in the parallel pool
         - Explicit status verification for every segment
@@ -324,8 +329,8 @@ class TextToSpeech:
         if total == 0:
             return []
 
-        # Bounded concurrency: Keep between 1 and 3 to ensure network reliability
-        bounded_workers = max(1, min(3, max_workers))
+        # Bounded concurrency: Keep between 1 and 6 for maximum speed and network reliability
+        bounded_workers = max(1, min(6, max_workers))
         results: List[Optional[str]] = [None] * total
         completed_count = 0
 

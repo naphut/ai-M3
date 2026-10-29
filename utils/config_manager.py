@@ -1,18 +1,14 @@
-import sys
 import os
 import re
 import json
+import requests
 from pathlib import Path
 from typing import List, Tuple
 from utils.logger import logger
-from utils.file_utils import get_app_data_dir
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-DATA_DIR = get_app_data_dir()
-CONFIG_FILE = DATA_DIR / "config.json"
-BASE_CONFIG_FILE = BASE_DIR / "config.json"
-ENV_FILE = DATA_DIR / ".env"
-BASE_ENV_FILE = BASE_DIR / ".env"
+CONFIG_FILE = BASE_DIR / "config.json"
+ENV_FILE = BASE_DIR / ".env"
 
 def parse_key_string(raw: str) -> List[str]:
     """Parse comma, semicolon, or newline delimited API keys."""
@@ -40,41 +36,39 @@ def get_gemini_api_keys() -> List[str]:
                 keys.append(k)
 
     # 2. config.json
-    for cfg in [CONFIG_FILE, BASE_CONFIG_FILE]:
-        if cfg.exists():
-            try:
-                with open(cfg, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                    # Check list
-                    raw_list = data.get("gemini_api_keys", [])
-                    if isinstance(raw_list, list):
-                        for k in raw_list:
-                            k_clean = str(k).strip()
-                            if k_clean and k_clean not in keys:
-                                keys.append(k_clean)
-                    # Check single string
-                    single = data.get("gemini_api_key", "")
-                    if single:
-                        for k in parse_key_string(single):
-                            if k not in keys:
-                                keys.append(k)
-            except Exception as e:
-                logger.debug(f"Error reading config {cfg}: {e}")
+    if CONFIG_FILE.exists():
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                # Check list
+                raw_list = data.get("gemini_api_keys", [])
+                if isinstance(raw_list, list):
+                    for k in raw_list:
+                        k_clean = str(k).strip()
+                        if k_clean and k_clean not in keys:
+                            keys.append(k_clean)
+                # Check single string
+                single = data.get("gemini_api_key", "")
+                if single:
+                    for k in parse_key_string(single):
+                        if k not in keys:
+                            keys.append(k)
+        except Exception as e:
+            logger.debug(f"Error reading config.json: {e}")
 
     # 3. .env file
-    for env_path in [ENV_FILE, BASE_ENV_FILE]:
-        if env_path.exists():
-            try:
-                with open(env_path, "r", encoding="utf-8") as f:
-                    for line in f:
-                        line = line.strip()
-                        if line.startswith("GEMINI_API_KEY="):
-                            val = line.split("=", 1)[1].strip()
-                            for k in parse_key_string(val):
-                                if k not in keys:
-                                    keys.append(k)
-            except Exception:
-                pass
+    if ENV_FILE.exists():
+        try:
+            with open(ENV_FILE, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith("GEMINI_API_KEY="):
+                        val = line.split("=", 1)[1].strip()
+                        for k in parse_key_string(val):
+                            if k not in keys:
+                                keys.append(k)
+        except Exception as e:
+            pass
 
     # Prioritize official Google AI Studio keys (AIzaSy...)
     keys.sort(key=lambda k: 0 if k.startswith("AIzaSy") else 1)
@@ -103,16 +97,13 @@ def save_gemini_api_keys(keys: List[str]) -> bool:
 
     # Save to config.json
     try:
-        CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
         data = {}
-        for candidate_cfg in [CONFIG_FILE, BASE_CONFIG_FILE]:
-            if candidate_cfg.exists():
-                try:
-                    with open(candidate_cfg, "r", encoding="utf-8") as f:
-                        data = json.load(f)
-                    break
-                except Exception:
-                    pass
+        if CONFIG_FILE.exists():
+            try:
+                with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception:
+                data = {}
         data["gemini_api_keys"] = clean_keys
         data["gemini_api_key"] = joined
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
@@ -177,9 +168,8 @@ def test_gemini_api_key(key: str) -> Tuple[bool, str]:
     clean_key = (key or "").strip()
     if not clean_key:
         return False, "API Key is empty."
-
     import requests
-    candidate_models = ["gemini-3.1-flash-lite", "gemini-flash-lite-latest"]
+    candidate_models = ["gemini-flash-lite-latest", "gemini-3.5-flash-lite", "gemini-flash-latest", "gemini-3.1-flash-lite"]
     headers = {
         "Content-Type": "application/json",
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko)"

@@ -468,6 +468,27 @@ class VideoProcessor:
             orig_w=orig_w,
             orig_h=orig_h
         )
+
+        # Check if visual effects are already pre-rendered into fast cache
+        if is_needed:
+            try:
+                from core.visual_prerender import get_prerendered_effects_path
+                res_cand = target_resolution or "Original"
+                prerendered_cand = get_prerendered_effects_path(self.video_path, effects_config, target_resolution=res_cand)
+                if prerendered_cand and os.path.exists(prerendered_cand) and os.path.getsize(prerendered_cand) > 50000:
+                    from utils.logger import logger
+                    logger.info(f"⚡ [Fast Pre-Render Cache] Reusing pre-baked visual master: {os.path.basename(prerendered_cand)} (Instant Mode A Stream Copy)!")
+                    if master_audio_path and os.path.exists(master_audio_path):
+                        from services.video_service import VideoService
+                        return VideoService(prerendered_cand).merge_dubbed_audio(
+                            dubbed_audio_path=master_audio_path,
+                            output_video_path=output_path,
+                            music_audio_path=music_audio_path,
+                            background_volume=background_volume
+                        )
+            except Exception as e_pre:
+                pass
+
         if not is_needed:
             if master_audio_path and os.path.exists(master_audio_path):
                 return self.merge_dubbed_audio(

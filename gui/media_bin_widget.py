@@ -897,6 +897,12 @@ class MediaBinWidget(QWidget):
                     "thumbnail": thumb_pix
                 })
                 newly_added.append(abs_p)
+                
+                # Smooth responsive streaming: refresh table and keep UI loop active
+                if len(newly_added) % 2 == 0 or len(paths) <= 5:
+                    self._refresh_table()
+                QApplication.processEvents()
+
         self._refresh_table()
 
         # Instant Preview: Automatically load the first imported clip into the Studio Player & Timeline
@@ -906,8 +912,8 @@ class MediaBinWidget(QWidget):
     def _refresh_table(self):
         n = len(self.items)
         self.badge_lbl.setText(str(n))
-        self.combine_btn.setEnabled(n > 0)
-        self.batch_btn.setEnabled(n > 0)
+        self.combine_btn.setEnabled(n > 0 and not self.is_batch_running)
+        self.batch_btn.setEnabled((n > 0) or self.is_batch_running)
 
         if n == 0:
             self.stack_lay.setCurrentIndex(0)

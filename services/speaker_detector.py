@@ -137,28 +137,59 @@ class SpeakerDetector:
             logger.debug(f"Audio pitch extraction exception: {e}")
             return 0.0
 
-    def classify_text_speaker(self, khmer_text: str, original_text: str) -> dict:
+    @staticmethod
+    def classify_text_speaker(khmer_text: str, original_text: str) -> dict:
         """
-        Analyze text semantics WITHOUT confusing addressees (e.g. child calling 'Mom' or 'Dad')
-        with the speaking character.
+        Analyze universal grammatical markers, politeness particles, and kinship forms
+        across any video or genre (without drama-specific names or plot keywords).
         """
-        combined = f"{original_text} {khmer_text}".lower()
+        orig_lower = (original_text or "").lower()
+        khm_lower = (khmer_text or "").lower()
+        combined = f"{orig_lower} {khm_lower}"
 
-        # Explicit tags
+        # 1. Explicit tags
         has_child_tag = any(t in combined for t in ['[ក្មេង]', '[ក្មេងប្រុស]', '[ក្មេងស្រី]'])
         has_elder_f_tag = '[ចាស់ស្រី]' in combined
         has_elder_m_tag = any(t in combined for t in ['[ចាស់ប្រុស]', '[ចាស់]'])
         has_female_tag = '[ស្រី]' in combined
         has_male_tag = '[ប្រុស]' in combined
 
-        # Self-referential cues (speaker talking about themselves)
-        child_self = any(w in combined for t in ['កូនឈ្មោះ', 'នៀននៀន', 'nian nian', 'niannian', 'កូនឃ្លាន', 'កូនខ្លាច', 'កូនចង់'] for w in [t])
-        elder_m_self = any(w in combined for t in ['លោកតាខ្ញុំ', 'តានិយាយ', 'តាប្រាប់', 'តាដឹង'] for w in [t])
-        elder_f_self = any(w in combined for t in ['លោកយាយខ្ញុំ', 'យាយនិយាយ', 'យាយប្រាប់', 'យាយដឹង'] for w in [t])
+        # 2. Universal Child Indicators (grammar/kinship: kid calling parents, crying/fear, childlike pronouns)
+        child_grammar = [
+            'កូនឃ្លាន', 'កូនខ្លាច', 'កូនចង់', 'កូនអត់', 'ប៉ាៗ', 'ម៉ាក់ៗ', 'តុក្កតា', 'ស្ករគ្រាប់', 'ក្មេងតូច',
+            '小朋友', '小孩', '宝宝', '幼童', '小孩子'
+        ]
+        is_child = has_child_tag or any(p in combined for p in child_grammar)
 
-        # Female indicators
-        female_name_cues = any(w in combined for w in ['sreymom', 'sreyka', 'ស្រីកា', 'នារី', 'នាង', 'អ្នកនាង', 'លោកស្រី', 'អ្នកស្រី'])
-        male_name_cues = any(w in combined for w in ['piseth', 'vannak', 'បុរស', 'លោកប្រធាន', 'លោកម្ចាស់', 'ពូ'])
+        # 3. Universal Elder Female Indicators (grandmother/senior female address forms)
+        elder_f_grammar = [
+            'លោកយាយ', 'យាយខ្ញុំ', 'យាយប្រាប់', 'យាយដឹង',
+            '老太太', '老奶奶', '老太婆', '外婆', '老妪'
+        ]
+        is_elder_f = has_elder_f_tag or any(p in combined for p in elder_f_grammar)
+
+        # 4. Universal Elder Male Indicators (grandfather/senior male address forms)
+        elder_m_grammar = [
+            'លោកតា', 'តាខ្ញុំ', 'តាប្រាប់', 'តាដឹង', 'តាឯង',
+            '老爷爷', '老伯', '大爷', '老夫', '老朽'
+        ]
+        is_elder_m = has_elder_m_tag or any(p in combined for p in elder_m_grammar)
+
+        # 5. Universal Female Indicators (Khmer female self-pronouns & particles, standard Chinese female honorifics)
+        # In Khmer, only females say 'ចាស' / 'ចាស៎', and 'នាងខ្ញុំ' is exclusively female self-pronoun.
+        female_grammar = [
+            'ចាស', 'ចាស៎', 'ច៎ាស', 'នាងខ្ញុំ', 'ខ្ញុំម្ចាស់',
+            '女士', '太太', '小姐', '姑娘', '夫人', '阿姨', '大妈'
+        ]
+        is_female = has_female_tag or any(p in combined for p in female_grammar)
+
+        # 6. Universal Male Indicators (Khmer male self-pronouns & particles, standard Chinese male honorifics)
+        # In Khmer, 'បាទ' and 'ខ្ញុំបាទ' are exclusively male polite particles/pronouns.
+        male_grammar = [
+            'ខ្ញុំបាទ', 'បាទ',
+            '先生', '大叔', '老兄'
+        ]
+        is_male = has_male_tag or any(p in combined for p in male_grammar)
 
         return {
             "has_child_tag": has_child_tag,
@@ -166,17 +197,23 @@ class SpeakerDetector:
             "has_elder_m_tag": has_elder_m_tag,
             "has_female_tag": has_female_tag,
             "has_male_tag": has_male_tag,
-            "child_self": child_self,
-            "elder_m_self": elder_m_self,
-            "elder_f_self": elder_f_self,
-            "female_name": female_name_cues,
-            "male_name": male_name_cues
+            "is_child": is_child,
+            "is_elder_f": is_elder_f,
+            "is_elder_m": is_elder_m,
+            "is_female": is_female,
+            "is_male": is_male,
+            "child_self": is_child,
+            "elder_m_self": is_elder_m,
+            "elder_f_self": is_elder_f,
+            "female_name": is_female,
+            "male_name": is_male
         }
 
     def diarize_and_profile_segments(self, segments: List[Dict]) -> List[Dict]:
         """
-        Perform Acoustic-First Speaker Diarization with Conversational Continuity.
-        Guarantees consecutive lines by the same character maintain voice stability.
+        Perform Acoustic-First Universal Speaker Diarization with Conversational Continuity.
+        Prioritizes the actual human acoustic audio frequency (F0 pitch) and universal context.
+        Works across all genres and videos without movie-specific hardcoding.
         """
         processed_segments = []
         last_role = None
@@ -185,11 +222,10 @@ class SpeakerDetector:
         last_persona = None
         last_end_sec = 0.0
         last_pitch = 0.0
-        all_text = " ".join([str(s.get("khmer_text", "")) + " " + str(s.get("original_text", "")) for s in segments]).lower()
-        has_girl_context = any(w in all_text for w in ['នៀននៀន', 'nian nian', 'niannian', 'ក្មេងស្រី', 'កូនស្រី', 'sreyka', 'girl'])
-        has_boy_context = any(w in all_text for w in ['ក្មេងប្រុស', 'កូនប្រុស', 'vannak', 'boy'])
-        default_child_voice = "Khmer Child - Girl (Sreyka)" if (has_girl_context and not has_boy_context) else "Khmer Child - Boy (Vannak)"
-        default_child_persona = "Girl / Child" if default_child_voice == "Khmer Child - Girl (Sreyka)" else "Boy / Child"
+        last_clean_khmer = ""
+
+        default_child_voice = "Khmer Child - Boy (Vannak)"
+        default_child_persona = "Boy / Child"
 
         for i, seg in enumerate(segments):
             st = float(seg.get("start", i * 3.0))
@@ -205,116 +241,133 @@ class SpeakerDetector:
                 explicit_tag = f"[{tag_m.group(1)}]"
                 clean_khmer = clean_khmer[len(tag_m.group(0)):].strip()
 
-            # Measure acoustic pitch F0 directly from vocal audio
+            # Measure acoustic vocal pitch F0 directly from vocal audio waveform
             pitch_f0 = self.analyze_audio_segment_pitch(st, et)
             cues = self.classify_text_speaker(clean_khmer, orig_text)
 
-            time_gap = max(0.0, st - last_end_sec)
-            is_immediate_continuation = (i > 0 and time_gap < 1.6)
+            # Conversational dialogue turn & clause continuation check
+            prev_ended_clause = False
+            if last_clean_khmer:
+                prev_ended_clause = last_clean_khmer.strip().endswith(('.', '!', '?', '。', '！', '？', '?!', '~', 'ហ្អី?', 'ទេ?', 'ស្អី?', '។', '៕'))
 
-            # --- DECISION LOGIC: ACOUSTIC PITCH IS PRIMARY GROUND TRUTH ---
+            time_gap = max(0.0, st - last_end_sec)
+            can_continue = False
+            if i > 0 and time_gap < 1.4:
+                # Same pitch cluster
+                if pitch_f0 > 0.0 and last_pitch > 0.0 and abs(pitch_f0 - last_pitch) < 30.0:
+                    can_continue = True
+                # Run-on clause from previous speaker (did not end with punctuation, and this segment has no contradicting cues)
+                elif not prev_ended_clause and not (cues["is_female"] or cues["is_child"] or cues["is_elder_f"] or cues["is_elder_m"]):
+                    can_continue = True
+
+            existing_tag = seg.get("speaker_tag") or explicit_tag
+            existing_voice = seg.get("voice_id") or seg.get("voice")
+            existing_role = (seg.get("speaker_role") or seg.get("role") or seg.get("gender") or "").lower()
+            existing_persona = seg.get("persona") or seg.get("character")
+
+            # --- UNIVERSAL DECISION LOGIC: ACOUSTIC PITCH (PHYSICS) + GEMINI STORY CONTEXT ---
             role = None
             voice = None
             tag = None
             persona = None
 
-            # Case 1: High Pitch >= 225 Hz -> Physical Child voice
-            if pitch_f0 >= 225.0:
-                role = "child"
-                tag = "[ក្មេង]"
-                if is_immediate_continuation and last_role == "child" and last_voice:
-                    voice = last_voice
-                    persona = last_persona
-                elif cues["female_name"] or "sreyka" in orig_text.lower() or "នៀននៀន" in clean_khmer or "girl" in orig_text.lower():
-                    voice = "Khmer Child - Girl (Sreyka)"
-                    persona = "Girl / Child"
-                else:
-                    voice = default_child_voice
-                    persona = default_child_persona
+            # 1. ACOUSTIC PITCH AVAILABLE (F0 > 0.0) -> Acoustic physical vocal truth
+            if pitch_f0 > 0.0:
+                # Child vocal range: F0 >= 265 Hz
+                if pitch_f0 >= 265.0:
+                    role = "child"
+                    tag = "[ក្មេង]"
+                    is_girl = cues["is_female"] or existing_role == "female" or "[ក្មេងស្រី]" in str(existing_tag)
+                    voice = "Khmer Child - Girl (Sreyka)" if is_girl else "Khmer Child - Boy (Vannak)"
+                    persona = "Girl / Child" if is_girl else "Boy / Child"
 
-            # Case 2: Adult Female Pitch (168 Hz - 225 Hz)
-            elif 168.0 <= pitch_f0 < 225.0:
-                if cues["has_elder_f_tag"] or cues["elder_f_self"]:
-                    role = "elder_female"
-                    tag = "[ចាស់ស្រី]"
-                    voice = "Khmer Elder - Female (Grandmother)"
-                    persona = "Elderly Female"
-                else:
-                    role = "female"
-                    tag = "[ស្រី]"
-                    voice = "Khmer Female - Sreymom"
-                    persona = "Female Adult"
-
-            # Case 3: Adult Male Pitch (65 Hz - 168 Hz)
-            elif 65.0 <= pitch_f0 < 168.0:
-                if (pitch_f0 < 112.0 and (cues["has_elder_m_tag"] or cues["elder_m_self"])) or explicit_tag == "[ចាស់ប្រុស]":
-                    role = "elder_male"
-                    tag = "[ចាស់ប្រុស]"
-                    voice = "Khmer Elder - Male (Grandfather)"
-                    persona = "Elderly Male"
-                else:
-                    role = "male"
-                    tag = "[ប្រុស]"
-                    voice = "Khmer Male - Piseth"
-                    persona = "Male Adult"
-
-            # Case 4: Unvoiced / Whisper / Missing Audio (pitch_f0 == 0.0)
-            else:
-                # If conversational continuation (< 1.6s gap) and previous speaker was established, inherit it
-                if is_immediate_continuation and last_role:
-                    role = last_role
-                    voice = last_voice
-                    tag = last_tag
-                    persona = last_persona
-                # Check explicit tags
-                elif explicit_tag:
-                    if explicit_tag in ("[ក្មេង]", "[ក្មេងប្រុស]", "[ក្មេងស្រី]"):
-                        role = "child"
-                        tag = "[ក្មេង]"
-                        voice = "Khmer Child - Girl (Sreyka)" if cues["female_name"] else "Khmer Child - Boy (Vannak)"
-                        persona = "Girl / Child" if cues["female_name"] else "Boy / Child"
-                    elif explicit_tag == "[ចាស់ស្រី]":
+                # Adult Female vocal range: 165 Hz <= F0 < 265 Hz
+                elif pitch_f0 >= 165.0:
+                    if cues["is_elder_f"] or existing_role == "elder_female" or existing_tag == "[ចាស់ស្រី]":
                         role = "elder_female"
                         tag = "[ចាស់ស្រី]"
                         voice = "Khmer Elder - Female (Grandmother)"
                         persona = "Elderly Female"
-                    elif explicit_tag in ("[ចាស់ប្រុស]", "[ចាស់]"):
-                        role = "elder_male"
-                        tag = "[ចាស់ប្រុស]"
-                        voice = "Khmer Elder - Male (Grandfather)"
-                        persona = "Elderly Male"
-                    elif explicit_tag == "[ស្រី]":
+                    else:
                         role = "female"
                         tag = "[ស្រី]"
                         voice = "Khmer Female - Sreymom"
                         persona = "Female Adult"
+
+                # Adult Male vocal range: 65 Hz <= F0 < 165 Hz
+                else:
+                    if (pitch_f0 < 110.0 and (cues["is_elder_m"] or existing_role == "elder_male" or existing_tag in ("[ចាស់ប្រុស]", "[ចាស់]"))):
+                        role = "elder_male"
+                        tag = "[ចាស់ប្រុស]"
+                        voice = "Khmer Elder - Male (Grandfather)"
+                        persona = "Elderly Male"
                     else:
                         role = "male"
                         tag = "[ប្រុស]"
                         voice = "Khmer Male - Piseth"
                         persona = "Male Adult"
-                elif cues["child_self"]:
-                    role = "child"
-                    tag = "[ក្មេង]"
-                    voice = "Khmer Child - Girl (Sreyka)"
-                    persona = "Girl / Child"
-                elif cues["female_name"]:
+
+            # 2. ACOUSTIC PITCH NOT AVAILABLE (F0 == 0.0) -> Use Gemini Story Context & Universal Grammar
+            else:
+                # Priority 2A: Explicit specific character role from Gemini Story Analysis
+                if existing_role in ("female", "child", "elder_female", "elder_male") or existing_tag in ("[ស្រី]", "[ក្មេង]", "[ចាស់ស្រី]", "[ចាស់ប្រុស]"):
+                    if existing_role == "female" or existing_tag == "[ស្រី]":
+                        role = "female"
+                        tag = "[ស្រី]"
+                        voice = "Khmer Female - Sreymom"
+                        persona = "Female Adult"
+                    elif existing_role == "child" or existing_tag == "[ក្មេង]":
+                        role = "child"
+                        tag = "[ក្មេង]"
+                        is_girl = cues["is_female"] or existing_role == "female" or "[ក្មេងស្រី]" in str(existing_tag)
+                        voice = "Khmer Child - Girl (Sreyka)" if is_girl else default_child_voice
+                        persona = "Girl / Child" if is_girl else default_child_persona
+                    elif existing_role == "elder_female" or existing_tag == "[ចាស់ស្រី]":
+                        role = "elder_female"
+                        tag = "[ចាស់ស្រី]"
+                        voice = "Khmer Elder - Female (Grandmother)"
+                        persona = "Elderly Female"
+                    elif existing_role == "elder_male" or existing_tag in ("[ចាស់ប្រុស]", "[ចាស់]"):
+                        role = "elder_male"
+                        tag = "[ចាស់ប្រុស]"
+                        voice = "Khmer Elder - Male (Grandfather)"
+                        persona = "Elderly Male"
+
+                # Priority 2B: Universal Grammatical & Politeness Markers
+                elif cues["is_female"]:
                     role = "female"
                     tag = "[ស្រី]"
                     voice = "Khmer Female - Sreymom"
                     persona = "Female Adult"
+                elif cues["is_child"]:
+                    role = "child"
+                    tag = "[ក្មេង]"
+                    voice = default_child_voice
+                    persona = default_child_persona
+                elif cues["is_elder_f"]:
+                    role = "elder_female"
+                    tag = "[ចាស់ស្រី]"
+                    voice = "Khmer Elder - Female (Grandmother)"
+                    persona = "Elderly Female"
+                elif cues["is_elder_m"]:
+                    role = "elder_male"
+                    tag = "[ចាស់ប្រុស]"
+                    voice = "Khmer Elder - Male (Grandfather)"
+                    persona = "Elderly Male"
+
+                # Priority 2C: Conversational sentence continuation
+                elif can_continue and last_role:
+                    role = last_role
+                    voice = last_voice
+                    tag = last_tag
+                    persona = last_persona
+
+                # Priority 2D: Male default
                 else:
                     role = "male"
                     tag = "[ប្រុស]"
                     voice = "Khmer Male - Piseth"
                     persona = "Male Adult"
-
-            # Conversational Smoothing: If previous speaker was child and pitch is high or unvoiced, keep child
-            if is_immediate_continuation and last_role == "child" and (pitch_f0 >= 210.0 or pitch_f0 == 0.0):
-                role = "child"
-                tag = "[ក្មេង]"
-                voice = last_voice or "Khmer Child - Girl (Sreyka)"
-                persona = last_persona or "Girl / Child"
 
             # Update speaker memory
             last_role = role
@@ -323,6 +376,7 @@ class SpeakerDetector:
             last_persona = persona
             last_end_sec = et
             last_pitch = pitch_f0
+            last_clean_khmer = clean_khmer
 
             # Store updated segment fields
             updated = dict(seg)

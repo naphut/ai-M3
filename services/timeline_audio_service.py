@@ -277,7 +277,73 @@ class TimelineAudioService:
             if os.path.exists(output_path) and os.path.getsize(output_path) > 1000:
                 return _ret(output_path, total_duration)
 
-        # Multi-Clip Assembly: Build inputs & filter graph
+        # Handle Large Clip Count (> 12 clips):
+        # Directly use sequential per-clip stem extraction + concat list demuxer to prevent OS descriptor limits
+        if len(video_clips) > 12:
+            logger.info(f"⚡ [TimelineAudio] Large clip count ({len(video_clips)} clips). Using robust sequential stem extraction...")
+            temp_wavs = []
+            try:
+                for idx, c in enumerate(video_clips):
+                    p = c.get("path", "")
+                    dur = max(0.01, float(c.get("duration", 0.0)))
+                    part_wav = get_temp_path(f"part_{hash_id}_{idx}.wav")
+                    if p and os.path.exists(p) and has_audio_stream(p):
+                        filt = _build_clip_audio_filter(c, "0:a", "aout", sample_rate, channels)
+                        cmd_part = [
+                            "ffmpeg", "-y",
+                            "-i", p,
+                            "-filter_complex", filt,
+                            "-map", "[aout]",
+                            "-c:a", "pcm_s16le",
+                            "-ar", str(sample_rate),
+                            "-ac", str(channels),
+                            part_wav
+                        ]
+                    else:
+                        cmd_part = [
+                            "ffmpeg", "-y",
+                            "-f", "lavfi", "-i", f"anullsrc=r={sample_rate}:cl={'stereo' if channels==2 else 'mono'}",
+                            "-t", f"{dur:.3f}",
+                            "-c:a", "pcm_s16le",
+                            "-ar", str(sample_rate),
+                            "-ac", str(channels),
+                            part_wav
+                        ]
+                    subprocess.run(cmd_part, capture_output=True, check=False)
+                    if os.path.exists(part_wav):
+                        temp_wavs.append(part_wav)
+
+                if temp_wavs:
+                    list_txt = get_temp_path(f"concat_list_{hash_id}.txt")
+                    with open(list_txt, "w") as f:
+                        for tw in temp_wavs:
+                            f.write(f"file '{os.path.abspath(tw)}'\n")
+
+                    cmd_concat = [
+                        "ffmpeg", "-y",
+                        "-f", "concat", "-safe", "0",
+                        "-i", list_txt,
+                        "-c:a", "pcm_s16le",
+                        "-ar", str(sample_rate),
+                        "-ac", str(channels),
+                        output_path
+                    ]
+                    subprocess.run(cmd_concat, capture_output=True, check=False)
+
+                    for tw in temp_wavs:
+                        try: os.remove(tw)
+                        except Exception: pass
+                    try: os.remove(list_txt)
+                    except Exception: pass
+
+                    if os.path.exists(output_path) and os.path.getsize(output_path) > 1000:
+                        actual_dur = get_audio_duration(output_path) or total_duration
+                        logger.info(f"✅ [TimelineAudio] Sequential stem concat built composite audio: {output_path} ({actual_dur:.1f}s)")
+                        return _ret(output_path, actual_dur)
+            except Exception as e_fb:
+                logger.error(f"❌ [TimelineAudio] Sequential concat error: {e_fb}")
+
+        # Multi-Clip Assembly: Build inputs & filter graph (for <= 12 clips)
         inputs = []
         filter_parts = []
         stream_labels = []

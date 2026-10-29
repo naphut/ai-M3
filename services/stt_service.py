@@ -21,17 +21,16 @@ from services.vad_service import VADService
 from utils.logger import logger
 from utils.config_manager import get_gemini_api_key
 from utils.file_utils import get_temp_path
-from utils.ffmpeg import safe_run_ffmpeg, get_ffmpeg_executable, get_ffprobe_executable
 
 class STTService:
     def __init__(self, api_key: Optional[str] = None):
         self.api_key = api_key or get_gemini_api_key()
         # Production model hierarchy (gemini-3.5-transcribe & gemini-3.1-flash-lite are active & available)
         self.models = [
-            "gemini-3.1-flash-lite",
             "gemini-flash-lite-latest",
-            "gemini-3.1-flash-lite-preview",
-            "gemini-3.5-flash-lite"
+            "gemini-3.5-flash-lite",
+            "gemini-flash-latest",
+            "gemini-3.1-flash-lite"
         ]
         self.vad_service = VADService()
 
@@ -76,7 +75,7 @@ class STTService:
             progress_callback(5, "Initializing High-Speed Local Faster-Whisper (int8 + Silero VAD)...")
 
         from services.whisper_service import WhisperService
-        whisper_svc = WhisperService(model_size="small")
+        whisper_svc = WhisperService(model_size="base")
         whisper_svc.initialize()
         raw_segs = whisper_svc.transcribe(
             audio_path,
@@ -164,16 +163,14 @@ class STTService:
                     "-i", audio_path, "-vn", "-ar", "16000", "-ac", "1", "-b:a", "32k",
                     chunk_file
                 ]
-                safe_run_ffmpeg(cmd)
-                active_file = chunk_file if (os.path.exists(chunk_file) and os.path.getsize(chunk_file) > 0) else audio_path
+                subprocess.run(cmd, capture_output=True, check=False)
+                active_file = chunk_file if os.path.exists(chunk_file) else audio_path
                 pct = int(10 + (idx / float(total_chunks)) * 80)
                 msg = f"Gemini STT: Transcribing chunk {idx+1}/{total_chunks} ({int(start_sec//60)}m - {int((start_sec+dur_sec)//60)}m)..."
             else:
                 active_file = get_temp_path("stt_compressed.mp3")
                 cmd = ["ffmpeg", "-y", "-i", audio_path, "-vn", "-ar", "16000", "-ac", "1", "-b:a", "32k", active_file]
-                safe_run_ffmpeg(cmd)
-                if not os.path.exists(active_file) or os.path.getsize(active_file) == 0:
-                    active_file = audio_path
+                subprocess.run(cmd, capture_output=True, check=False)
                 pct = 35
                 msg = "Gemini STT: Transcribing speech with timestamps and speaker diarization..."
 
@@ -184,7 +181,7 @@ class STTService:
                 active_file,
                 source_lang=source_lang,
                 api_key=api_key
-            )
+            ) or []
 
             for item in raw_chunk_segments:
                 seg_start = round(item.get("start", 0.0) + start_sec, 2)
@@ -257,7 +254,7 @@ class STTService:
 
             try:
                 logger.info(f"🌐 Calling Gemini STT ({model})...")
-                resp = requests.post(url, headers=headers, json=payload, timeout=20)
+                resp = requests.post(url, headers=headers, json=payload, timeout=45)
                 if resp.status_code == 200:
                     data = resp.json()
                     candidates = data.get("candidates", [])
@@ -274,6 +271,9 @@ class STTService:
                 last_error = f"Gemini {model} error: {e}"
                 logger.warning(last_error)
                 continue
+
+        logger.error(f"❌ Gemini Cloud STT failed across all models: {last_error}")
+        return []
 
 
     def _parse_json_array(self, raw_text: str) -> List[Dict[str, Any]]:
@@ -359,7 +359,7 @@ class STTService:
             if curr.raw_end is None:
                 curr.raw_end = curr.end
 
-            text = (curr.original_text or curr.text or "").strip()
+            text = (getattr(curr, 'original_text', '') or getattr(curr, 'text', '') or "").strip()
             # Only discard truly empty segments or pure punctuation with no words
             clean_text = re.sub(r'^[^\w\s]+|[^\w\s]+$', '', text).strip()
             if not clean_text:
@@ -390,7 +390,7 @@ class STTService:
                 continue
 
             prev = normalized[-1]
-            prev_text = (prev.original_text or prev.text or "").strip()
+            prev_text = (getattr(prev, 'original_text', '') or getattr(prev, 'text', '') or "").strip()
             prev_words = prev.words or []
 
             # 1. Repetition / Glitch Detection (Requirement 10)
@@ -413,7 +413,8 @@ class STTService:
                 elif prev_text.lower() in text.lower():
                     # Curr is the fuller phrase, update prev text without cutting
                     prev.original_text = curr.original_text
-                    prev.text = curr.text
+                    if hasattr(prev, 'text'):
+                        prev.text = curr.original_text
                     continue
 
             # 3. Safe Word-Aware Overlap Resolution (Requirement 7 & 8)
@@ -482,8 +483,7 @@ class STTService:
 
     def _get_duration_sec(self, audio_path: str) -> float:
         try:
-            ffprobe_bin = get_ffprobe_executable()
-            cmd = [ffprobe_bin, "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", audio_path]
+            cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", audio_path]
             res = subprocess.run(cmd, capture_output=True, text=True, check=False)
             if res.returncode == 0 and res.stdout.strip():
                 return float(res.stdout.strip())

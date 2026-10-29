@@ -35,10 +35,10 @@ class GeminiAudioService:
         self.api_key = self.api_keys[0] if self.api_keys else ""
         self._key_index = 0
         self.models = [
-            "gemini-3.1-flash-lite",
             "gemini-flash-lite-latest",
-            "gemini-3.1-flash-lite-preview",
-            "gemini-3.5-flash-lite"
+            "gemini-3.5-flash-lite",
+            "gemini-flash-latest",
+            "gemini-3.1-flash-lite"
         ]
         self._active_model: Optional[str] = None
 
@@ -58,10 +58,10 @@ class GeminiAudioService:
     def _get_supported_models(self, api_key: str = "") -> List[str]:
         """Return strictly curated ultra-fast multimodal speech models."""
         curated_priority = [
-            "gemini-3.1-flash-lite",
             "gemini-flash-lite-latest",
-            "gemini-3.1-flash-lite-preview",
-            "gemini-3.5-flash-lite"
+            "gemini-3.5-flash-lite",
+            "gemini-flash-latest",
+            "gemini-3.1-flash-lite"
         ]
         if self._active_model and self._active_model in curated_priority:
             curated_priority.remove(self._active_model)

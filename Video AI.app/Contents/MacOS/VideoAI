@@ -1,0 +1,16 @@
+#!/bin/bash
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
+export PYTHONUNBUFFERED=1
+
+APP_DIR="/Users/retnaphut/Documents/vide ai"
+cd "$APP_DIR" || exit 1
+
+if [ -f "$APP_DIR/.venv/bin/activate" ]; then
+    source "$APP_DIR/.venv/bin/activate"
+    exec python main.py
+elif [ -f "$APP_DIR/venv/bin/activate" ]; then
+    source "$APP_DIR/venv/bin/activate"
+    exec python main.py
+else
+    exec python3 main.py
+fi

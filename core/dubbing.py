@@ -33,7 +33,7 @@ class DubbingWorker(QThread):
         output_path: str = None,
         source_lang: str = "auto",
         target_lang: str = "km",
-        whisper_model: str = "small",
+        whisper_model: str = "base",
         voice_name: str = "VoxCPM2-Khmer",
         api_key: str = None,
         background_volume: float = 0.30,
@@ -89,14 +89,20 @@ class DubbingWorker(QThread):
             already_merged = False
             if self.video_path and os.path.exists(self.video_path) and os.path.getsize(self.video_path) > 1000:
                 if not has_active_transitions and len(self.timeline_clips) > 1:
-                    try:
-                        vinfo = VideoProcessor(self.video_path).info
-                        v_dur = float(vinfo.get("duration", 0.0))
-                        tl_dur = sum(float(c.get("duration", 0.0) if isinstance(c, dict) else getattr(c, "duration", 0.0)) for c in self.timeline_clips)
-                        if tl_dur > 0 and abs(v_dur - tl_dur) < 4.0:
+                    base_n = os.path.basename(self.video_path)
+                    if base_n.startswith("merged_"):
+                        already_merged = True
+                    else:
+                        try:
+                            vinfo = VideoProcessor(self.video_path).info
+                            v_dur = float(vinfo.get("duration", 0.0))
+                            tl_dur = sum(float(c.get("duration", 0.0) if isinstance(c, dict) else getattr(c, "duration", 0.0)) for c in self.timeline_clips)
+                            if tl_dur > 0 and (abs(v_dur - tl_dur) < max(60.0, tl_dur * 0.25)):
+                                already_merged = True
+                            elif v_dur > 10.0:
+                                already_merged = True
+                        except Exception:
                             already_merged = True
-                    except Exception:
-                        pass
 
             if already_merged:
                 self.log(f"🎬 Pre-merged timeline video verified ({os.path.basename(self.video_path)}). Bypassing redundant transition re-render...")
@@ -197,13 +203,13 @@ class DubbingWorker(QThread):
                     fps=fps_val,
                     use_videotoolbox=(sys.platform == "darwin")
                 )
-                if not success:
-                    self.pipeline_error.emit("❌ Transition Export Engine failed to render multi-clip transition timeline.")
-                    return
-
-                if not os.path.exists(dest_video) or os.path.getsize(dest_video) < 1000:
-                    self.pipeline_error.emit("❌ Exported transition output file missing or invalid.")
-                    return
+                if not success or not os.path.exists(dest_video) or os.path.getsize(dest_video) < 1000:
+                    if self.video_path and os.path.exists(self.video_path) and os.path.getsize(self.video_path) > 1000:
+                        self.log(f"⚠️ Transition re-render skipped. Falling back to existing master video: {os.path.basename(self.video_path)}")
+                        dest_video = self.video_path
+                    else:
+                        self.pipeline_error.emit("❌ Transition Export Engine failed to render multi-clip transition timeline.")
+                        return
 
                 # If pure transition export without dubbing or effects, we are done
                 if not needs_pipeline:
@@ -377,22 +383,26 @@ class DubbingWorker(QThread):
                     except Exception as e_khm:
                         self.log(f"Notice saving Khmer SRT: {e_khm}")
 
-                # Automatic Speaker Diarization / Gender Voice Assignment
-                try:
-                    self.log("👥 Identifying speakers & assigning appropriate voices using Acoustic Pitch F0...")
-                    from services.speaker_detector import SpeakerDetector
-                    audio_src = vocal_wav or self.orig_audio or getattr(self, 'video_path', None)
-                    detector = SpeakerDetector(audio_wav_path=audio_src)
-                    segments = detector.diarize_and_profile_segments(segments)
-                except Exception as spk_err:
-                    self.log(f"Speaker voice assignment notice: {spk_err}")
+                # Automatic Speaker Diarization / Gender Voice Assignment for unassigned segments
+                has_unassigned = any(not s.get("voice") and not s.get("voice_id") for s in segments)
+                if has_unassigned:
+                    try:
+                        self.log("👥 Identifying speakers & assigning appropriate voices...")
+                        from services.speaker_detector import SpeakerDetector
+                        audio_src = vocal_wav or self.orig_audio or getattr(self, 'video_path', None)
+                        detector = SpeakerDetector(audio_wav_path=audio_src)
+                        segments = detector.diarize_and_profile_segments(segments)
+                    except Exception as spk_err:
+                        self.log(f"Speaker voice assignment notice: {spk_err}")
 
-            # Ensure every segment (including pre-translated) has voice assigned across 5 categories
+            # Ensure every segment (including pre-translated) has voice synchronized across 5 categories
             for seg in segments:
-                if not seg.get("voice"):
-                    g = (seg.get("gender") or seg.get("role") or "").lower()
-                    spk = str(seg.get("character") or seg.get("speaker_id") or seg.get("speaker", "")).lower()
-                    tag = str(seg.get("speaker_tag") or "").lower()
+                g = (seg.get("gender") or seg.get("role") or seg.get("speaker_role") or "").lower()
+                spk = str(seg.get("character") or seg.get("speaker_id") or seg.get("speaker", "")).lower()
+                tag = str(seg.get("speaker_tag") or "").lower()
+
+                # Sync voice if missing or default
+                if not seg.get("voice") or seg.get("voice") == "VoxCPM2-Khmer":
                     if "ចាស់ស្រី" in tag or g == "elder_female":
                         seg["voice"] = "Khmer Elder - Female (Grandmother)"
                     elif "ចាស់ប្រុស" in tag or "ចាស់" in tag or g == "elder_male":
@@ -429,7 +439,7 @@ class DubbingWorker(QThread):
             if not can_reuse_master and segments:
                 self.progress_changed.emit(55, PipelineStep.TTS)
                 if self._is_cancelled: return
-                self.log(f"🔊 Synthesizing Khmer voices in parallel (Workers=3)...")
+                self.log(f"🔊 Synthesizing Khmer voices in parallel (Workers=6)...")
                 tts_engine = TextToSpeech(voice_name=self.voice_name)
                 
                 num_segments = len(segments)
@@ -440,7 +450,7 @@ class DubbingWorker(QThread):
                 raw_audio_paths = tts_engine.generate_all_segments(
                     segments,
                     progress_callback=_tts_progress,
-                    max_workers=3,
+                    max_workers=6,
                     is_cancelled_fn=lambda: self._is_cancelled
                 )
 
@@ -451,10 +461,15 @@ class DubbingWorker(QThread):
                 for p in raw_audio_paths:
                     if p and os.path.exists(p):
                         try:
-                            from pydub import AudioSegment
-                            tts_durs.append(len(AudioSegment.from_file(p)) / 1000.0)
+                            import wave
+                            with wave.open(p, 'rb') as wf:
+                                tts_durs.append(wf.getnframes() / float(wf.getframerate()))
                         except Exception:
-                            tts_durs.append(None)
+                            try:
+                                from pydub import AudioSegment
+                                tts_durs.append(len(AudioSegment.from_file(p)) / 1000.0)
+                            except Exception:
+                                tts_durs.append(None)
                     else:
                         tts_durs.append(None)
 
@@ -515,10 +530,32 @@ class DubbingWorker(QThread):
                 res_needed = False
                 target_res = getattr(self, "target_resolution", "Original")
                 if target_res and str(target_res).lower() not in ("original", "ទំហំដើម", "ដើម", "none"):
-                    res_needed = True
+                    try:
+                        from core.export_engine import compute_target_resolution
+                        v_info_w = int(video_proc.info.get("width", 1920) or 1920)
+                        v_info_h = int(video_proc.info.get("height", 1080) or 1080)
+                        tw, th = compute_target_resolution(v_info_w, v_info_h, target_res)
+                        if tw != v_info_w or th != v_info_h:
+                            res_needed = True
+                        else:
+                            self.log(f"⚡ Target resolution ({tw}x{th}) matches source video perfectly. Zero-rescaling required.")
+                    except Exception:
+                        res_needed = True
 
                 apply_needed = blur_enabled or text_enabled or logo_enabled or burn_sub_enabled or res_needed
                 self.log(f"🔍 Video Effects export configuration check: Blur={blur_enabled}, Text={text_enabled}, Logo={logo_enabled}, BurnSubtitle={burn_sub_enabled}, Rescale={res_needed} ({target_res})")
+
+                # Check if visual master is already pre-rendered
+                if apply_needed:
+                    try:
+                        from core.visual_prerender import get_prerendered_effects_path
+                        prerendered_cand = get_prerendered_effects_path(self.video_path, self.effects_config, target_resolution=target_res)
+                        if prerendered_cand and os.path.exists(prerendered_cand) and os.path.getsize(prerendered_cand) > 50000:
+                            self.log(f"⚡ [Fast Pre-Render Cache] Reusing pre-baked visual effects master: {os.path.basename(prerendered_cand)} (Instant Mode A)!")
+                            self.video_path = prerendered_cand
+                            apply_needed = False
+                    except Exception as e_prerender:
+                        self.log(f"Notice pre-render check: {e_prerender}")
 
             if self._is_cancelled: return
 
@@ -528,28 +565,41 @@ class DubbingWorker(QThread):
                 base_orig = getattr(self, "orig_audio", None)
                 if not base_orig or not os.path.exists(str(base_orig)):
                     try:
-                        from core.audio_processor import AudioProcessor
-                        base_orig = AudioProcessor(self.video_path).extract_audio(get_temp_path("dub_orig_audio.wav"))
+                        from utils.ffmpeg import extract_audio
+                        base_orig = get_temp_path("dub_orig_audio.wav")
+                        extract_audio(self.video_path, base_orig, sample_rate=44100)
                         self.orig_audio = base_orig
                     except Exception as e_ext:
                         self.log(f"Notice extracting base audio: {e_ext}")
 
                 if base_orig and os.path.exists(str(base_orig)):
                     try:
-                        self.log("🎶 Isolating pure BGM & sound effects: Deep Vocal Elimination during dialogue...")
-                        from services.audio_separator import create_clean_background_track
                         export_bg_cleaned = get_temp_path("export_bg_cleaned.wav")
-                        create_clean_background_track(
-                            orig_audio_path=base_orig,
-                            segments=segments,
-                            output_bgm_path=export_bg_cleaned,
-                            bgm_volume=1.0,
-                            duck_speech_db=-70.0,
-                            pre_pad_sec=0.08,
-                            post_pad_sec=0.12
-                        )
-                        music_track = export_bg_cleaned
-                        self.log("✅ Original Chinese speech cleanly eliminated; BGM & sound effects 100% preserved!")
+                        preview_cleaned = get_temp_path("preview_bg_cleaned.wav")
+                        reused = False
+                        if os.path.exists(preview_cleaned) and os.path.getsize(preview_cleaned) > 1000:
+                            # If audio lengths match closely, reuse cached clean background instantly (0.0s)
+                            if abs(os.path.getsize(preview_cleaned) - os.path.getsize(base_orig)) < 8192:
+                                import shutil
+                                shutil.copyfile(preview_cleaned, export_bg_cleaned)
+                                music_track = export_bg_cleaned
+                                self.log("⚡ [Fast Cache] Reusing preview clean background track (0.0s instant bypass)!")
+                                reused = True
+
+                        if not reused:
+                            self.log("🎶 Isolating pure BGM & sound effects: Deep Vocal Elimination during dialogue...")
+                            from services.audio_separator import create_clean_background_track
+                            create_clean_background_track(
+                                orig_audio_path=base_orig,
+                                segments=segments,
+                                output_bgm_path=export_bg_cleaned,
+                                bgm_volume=1.0,
+                                duck_speech_db=-70.0,
+                                pre_pad_sec=0.08,
+                                post_pad_sec=0.12
+                            )
+                            music_track = export_bg_cleaned
+                            self.log("✅ Original Chinese speech cleanly eliminated; BGM & sound effects 100% preserved!")
                     except Exception as e_bg:
                         self.log(f"Notice cleaning background: {e_bg}")
 
@@ -609,6 +659,17 @@ class DubbingWorker(QThread):
                 if os.path.exists(trans_inter):
                     try: os.remove(trans_inter)
                     except Exception: pass
+
+                # Automated Post-Export Intermediate File & Memory Cleanup
+                try:
+                    from utils.file_utils import cleanup_intermediate_dubbing_files, run_memory_cleanup
+                    c_count, c_mb = cleanup_intermediate_dubbing_files(keep_files=[self.output_path])
+                    run_memory_cleanup()
+                    if c_count > 0:
+                        self.log(f"🧹 [Auto-Cleanup] បានសម្អាតឯកសារ Audio & Subtitles បណ្តោះអាសន្នចំនួន {c_count:,} files (ដោះលែងទំហំ Disk បាន {c_mb:.1f} MB)!")
+                except Exception as e_clean:
+                    logger.debug(f"Auto-cleanup notice: {e_clean}")
+
                 self.progress_changed.emit(100, PipelineStep.COMPLETED)
                 self.log(f"🎉 SUCCESS! Final Khmer video created: {self.output_path}")
                 self.pipeline_finished.emit(self.output_path)

@@ -89,6 +89,14 @@ class DialogueSyncEngine:
 
                 try:
                     audio = AudioSegment.from_file(raw_path)
+                    # 🎯 Frame-accurate LipSync: Strip cloud TTS dead silence edges so speech starts/ends with lips
+                    from pydub.silence import detect_leading_silence
+                    s_trim = detect_leading_silence(audio, silence_threshold=-42.0)
+                    e_trim = detect_leading_silence(audio.reverse(), silence_threshold=-42.0)
+                    start_cut = max(0, s_trim - 25)
+                    end_cut = max(0, e_trim - 35)
+                    if (start_cut > 0 or end_cut > 0) and len(audio) - start_cut - end_cut > 60:
+                        audio = audio[start_cut:len(audio) - end_cut]
                     actual_ms = len(audio)
                 except Exception as e_dec:
                     err_dec = f"DialogueSync unreadable audio '{raw_path}' for segment {seg_id}: {e_dec}"
@@ -110,31 +118,43 @@ class DialogueSyncEngine:
                     nxt_st = nxt_seg.start if isinstance(nxt_seg, Segment) else float(nxt_seg.get("start", 0.0))
                     next_start_ms = max(start_ms + 200, int(nxt_st * 1000))
 
-                # 1. DURATION CHECK: Does it fit naturally within slot?
-                if actual_ms <= slot_ms:
-                    pass
-                else:
-                    # 2. TTS IS LONGER: Borrow available natural silence gap before next segment
-                    silence_gap_ms = max(0, next_start_ms - end_ms)
-                    # Allow borrowing up to 600ms of natural silence
-                    borrowable_ms = min(600, int(silence_gap_ms * 0.85))
-                    effective_slot_ms = slot_ms + borrowable_ms
+                silence_gap_ms = max(0, next_start_ms - end_ms)
+                # Cap pause borrowing to max 220ms (prevents speaking after mouth has closed)
+                borrowable_ms = min(220, int(silence_gap_ms * 0.50))
+                effective_slot_ms = slot_ms + borrowable_ms
 
+                # 1. DURATION CHECK & LIP-SYNC ADAPTIVE PACING
+                if actual_ms <= slot_ms:
+                    # If speech is substantially shorter than mouth movement (< 65%), gently relax pacing
+                    if actual_ms < int(slot_ms * 0.65) and actual_ms >= 350:
+                        relax_factor = max(0.92, actual_ms / float(slot_ms * 0.85))
+                        relax_path = get_temp_path(f"relaxed_seg_{i:03d}_{os.path.basename(raw_path)}")
+                        if adjust_audio_speed(raw_path, relax_path, relax_factor):
+                            audio = AudioSegment.from_file(relax_path)
+                            s_t = detect_leading_silence(audio, silence_threshold=-42.0)
+                            e_t = detect_leading_silence(audio.reverse(), silence_threshold=-42.0)
+                            audio = audio[max(0, s_t - 25):len(audio) - max(0, e_t - 35)]
+                            actual_ms = len(audio)
+                            logger.info(f"⏱ [DialogueSync] Seg {i+1}: Lip-Sync tempo relaxed ({relax_factor:.2f}x) to match mouth movement.")
+                else:
+                    # 2. TTS IS LONGER: Fit within effective mouth slot
                     if actual_ms <= effective_slot_ms:
-                        logger.info(f"⏱ [DialogueSync] Seg {i+1}: Borrowed {borrowable_ms}ms pause. Audio fits without stretching.")
+                        logger.info(f"⏱ [DialogueSync] Seg {i+1}: Audio fits actor mouth (+{actual_ms - slot_ms}ms natural decay).")
                     else:
-                        # Apply mild time-stretch clamped strictly to max stretch factor (up to 1.50x)
+                        # Apply mild time-stretch clamped strictly to max stretch factor
                         raw_speed = actual_ms / float(effective_slot_ms)
                         speed_factor = min(self.max_stretch_factor, max(self.min_stretch_factor, raw_speed))
                         
                         adjusted_path = get_temp_path(f"synced_seg_{i:03d}_{os.path.basename(raw_path)}")
                         if adjust_audio_speed(raw_path, adjusted_path, speed_factor):
                             audio = AudioSegment.from_file(adjusted_path)
-                            logger.info(f"⏱ [DialogueSync] Seg {i+1}: mild stretch applied ({speed_factor:.2f}x).")
+                            s_t = detect_leading_silence(audio, silence_threshold=-42.0)
+                            e_t = detect_leading_silence(audio.reverse(), silence_threshold=-42.0)
+                            audio = audio[max(0, s_t - 25):len(audio) - max(0, e_t - 35)]
+                            actual_ms = len(audio)
+                            logger.info(f"⏱ [DialogueSync] Seg {i+1}: Lip-sync stretch applied ({speed_factor:.2f}x).")
 
                 # 3. ANTI-COLLISION & DIALOGUE COMPLETION GUARANTEE:
-                # Never cut dialogue halfway through. If speech slightly overlaps with next segment start,
-                # prioritize speech compression up to max_stretch_factor.
                 max_allowed_len = max(250, next_start_ms - start_ms - 20)
                 if len(audio) > max_allowed_len:
                     total_needed_speed = len(audio) / float(max_allowed_len)
@@ -143,11 +163,11 @@ class DialogueSyncEngine:
                         speed_path = get_temp_path(f"anti_overlap_{i:03d}_{os.path.basename(raw_path)}")
                         if adjust_audio_speed(raw_path, speed_path, speed_factor):
                             audio = AudioSegment.from_file(speed_path)
+                            s_t = detect_leading_silence(audio, silence_threshold=-42.0)
+                            e_t = detect_leading_silence(audio.reverse(), silence_threshold=-42.0)
+                            audio = audio[max(0, s_t - 25):len(audio) - max(0, e_t - 35)]
                             logger.info(f"⏱ [DialogueSync] Seg {i+1}: Adaptive tempo speedup applied ({speed_factor:.2f}x) to preserve complete line.")
 
-                    # If after maximum tempo speedup the audio still slightly extends into the next segment,
-                    # DO NOT truncate the words! The additive timeline PCM buffer will smoothly blend
-                    # the ending decay with the next utterance rather than destroying the final spoken words.
                     if len(audio) > max_allowed_len:
                         logger.info(f"⏱ [DialogueSync] Seg {i+1}: Permitting natural word decay ({len(audio)}ms into next slot at {max_allowed_len}ms) to prevent cutting off speech.")
 
@@ -161,24 +181,39 @@ class DialogueSyncEngine:
                 except Exception:
                     pass
 
+                # Mouth opening micro-alignment
+                placed_start_ms = start_ms
+                if actual_ms < slot_ms - 150:
+                    placed_start_ms += min(50, int((slot_ms - actual_ms) * 0.15))
+
                 # Direct zero-copy placement onto 44.1kHz stereo PCM buffer
                 audio_stereo = audio.set_frame_rate(44100).set_channels(2)
                 raw_bytes = audio_stereo.raw_data
                 seg_samples = np.frombuffer(raw_bytes, dtype=np.int16).reshape(-1, 2)
-                st_sample = int(start_ms * 44.1)
+                st_sample = int(placed_start_ms * 44.1)
                 et_sample = min(total_samples, st_sample + len(seg_samples))
                 actual_len = et_sample - st_sample
                 if actual_len > 0:
                     timeline_pcm[st_sample:et_sample] += seg_samples[:actual_len].astype(np.int32)
 
-            # Export directly to 44.1kHz 16-bit WAV with zero clipping
-            clipped_pcm = np.clip(timeline_pcm, -32768, 32767).astype(np.int16)
+            # Export directly to 44.1kHz 16-bit WAV with zero clipping and minimal RAM footprint
+            np.clip(timeline_pcm, -32768, 32767, out=timeline_pcm)  # In-place clipping (zero extra RAM)
             import wave
+            import gc
+            target_export_samples = int(total_duration_sec * 44100)
             with wave.open(output_master_path, "wb") as wf:
                 wf.setnchannels(2)
                 wf.setsampwidth(2)
                 wf.setframerate(44100)
-                wf.writeframes(clipped_pcm.tobytes())
+                # Stream write in 60-second chunks to avoid allocating another giant array
+                block_size = 44100 * 60
+                for b_st in range(0, target_export_samples, block_size):
+                    b_et = min(target_export_samples, b_st + block_size)
+                    sub_chunk = timeline_pcm[b_st:b_et].astype(np.int16)
+                    wf.writeframes(sub_chunk.tobytes())
+
+            del timeline_pcm
+            gc.collect()
 
             logger.info(f"✅ [DialogueSync] Master dialogue track exported (44.1kHz stereo): {output_master_path}")
             return output_master_path

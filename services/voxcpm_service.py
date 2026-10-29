@@ -1030,21 +1030,34 @@ class VoxCPMService:
         # ==============================
         # 2. STANDARD KHMER TTS (For Stock Presets)
         # ==============================
-        if self._synthesize_edge_tts(text, output_wav_path, pitch_shift=pitch_shift, speed_factor=speed_factor, target_duration=target_duration):
-            self._apply_pitch_shift(output_wav_path, pitch_shift, speed_factor, ref_audio_path=prompt_audio, extra_filters=extra_dsp_filters)
+        dsp_chain = self._build_dsp_filter_chain(ref_audio_path=prompt_audio, extra_filters=extra_dsp_filters)
+        if self._synthesize_edge_tts(text, output_wav_path, pitch_shift=pitch_shift, speed_factor=speed_factor, target_duration=target_duration, filter_chain=dsp_chain):
+            # 1. Strip leading and trailing silence so voice starts the EXACT millisecond the actor opens mouth
+            if os.path.exists(output_wav_path):
+                self._trim_silence_edges(output_wav_path)
 
-            # Precise Lip-Sync Duration Alignment (ធានានិយាយត្រូវមាត់តួអង្គ)
+            # 2. Precise Lip-Sync Duration Alignment (ធានានិយាយត្រូវមាត់តួអង្គ)
             if target_duration and target_duration > 0.4 and os.path.exists(output_wav_path):
                 try:
                     with wave.open(output_wav_path, 'rb') as wf:
                         actual_dur = wf.getnframes() / float(wf.getframerate())
-                    if actual_dur > target_duration * 1.08:
+                    if actual_dur > target_duration * 1.05:
                         speed_align = min(1.35, actual_dur / float(target_duration))
                         temp_aligned = output_wav_path.replace(".wav", "_aligned.wav")
                         from utils.ffmpeg import adjust_audio_speed
                         if adjust_audio_speed(output_wav_path, temp_aligned, speed_align):
                             shutil.move(temp_aligned, output_wav_path)
+                            self._trim_silence_edges(output_wav_path)
                             logger.info(f"⏱ [LipSync] Speed aligned {speed_align:.2f}x to match actor mouth ({actual_dur:.2f}s -> {target_duration:.2f}s)")
+                    elif actual_dur < target_duration * 0.65 and actual_dur >= 0.4:
+                        # Gently relax tempo so speech doesn't finish way before the actor's lips stop moving
+                        speed_relax = max(0.92, actual_dur / float(target_duration * 0.85))
+                        temp_relaxed = output_wav_path.replace(".wav", "_relaxed.wav")
+                        from utils.ffmpeg import adjust_audio_speed
+                        if adjust_audio_speed(output_wav_path, temp_relaxed, speed_relax):
+                            shutil.move(temp_relaxed, output_wav_path)
+                            self._trim_silence_edges(output_wav_path)
+                            logger.info(f"⏱ [LipSync] Tempo relaxed {speed_relax:.2f}x to match mouth pacing ({actual_dur:.2f}s -> {target_duration:.2f}s)")
                 except Exception as e_align:
                     logger.debug(f"LipSync duration align exception: {e_align}")
 
@@ -1054,7 +1067,59 @@ class VoxCPMService:
         logger.error(f"❌ Failed to synthesize Khmer speech for: '{text[:30]}...'")
         return False
 
-    def _synthesize_edge_tts(self, text: str, output_wav_path: str, pitch_shift: float = 1.0, speed_factor: float = 1.0, target_duration: float = None) -> bool:
+    def _trim_silence_edges(self, wav_path: str, silence_thresh: float = -42.0, pad_start_ms: int = 25, pad_end_ms: int = 35) -> bool:
+        """Trim leading and trailing dead silence produced by cloud Edge-TTS so voice starts and ends exactly with actor mouth."""
+        try:
+            from pydub import AudioSegment
+            from pydub.silence import detect_leading_silence
+            audio = AudioSegment.from_file(wav_path)
+            if len(audio) < 100:
+                return False
+            
+            s_trim = detect_leading_silence(audio, silence_threshold=silence_thresh)
+            e_trim = detect_leading_silence(audio.reverse(), silence_threshold=silence_thresh)
+            
+            start_cut = max(0, s_trim - pad_start_ms)
+            end_cut = max(0, e_trim - pad_end_ms)
+            
+            if start_cut > 0 or end_cut > 0:
+                total_len = len(audio)
+                if total_len - start_cut - end_cut > 60:
+                    trimmed = audio[start_cut:total_len - end_cut]
+                    trimmed.export(wav_path, format="wav")
+                    return True
+        except Exception as e:
+            logger.debug(f"Notice trimming silence: {e}")
+        return False
+
+    def _build_dsp_filter_chain(self, ref_audio_path: str = None, apply_eq: bool = True, extra_filters: list = None) -> str:
+        """Build Studio Broadcast Mastering & Emotion/Style DSP filter chain."""
+        filters = [
+            "highpass=f=70",
+            "equalizer=f=250:width_type=q:width=1.2:g=1.8",
+            "equalizer=f=3500:width_type=q:width=1.5:g=1.2",
+            "equalizer=f=7500:width_type=q:width=2.0:g=-2.5",
+        ]
+
+        if extra_filters:
+            for ef in extra_filters:
+                if ef:
+                    filters.append(ef)
+
+        filters.extend([
+            "acompressor=threshold=-14dB:ratio=2.5:attack=15:release=120",
+            "loudnorm=I=-14:TP=-1.0:LRA=7",
+            "volume=1.2"
+        ])
+
+        if apply_eq and ref_audio_path and os.path.exists(ref_audio_path):
+            ref_eq = self._analyze_reference_spectral_eq(ref_audio_path)
+            if ref_eq:
+                filters.insert(1, ref_eq)
+
+        return ",".join(filters)
+
+    def _synthesize_edge_tts(self, text: str, output_wav_path: str, pitch_shift: float = 1.0, speed_factor: float = 1.0, target_duration: float = None, filter_chain: str = None) -> bool:
         """Synthesize using native Microsoft Neural TTS with natural SSML pitch, rate, and human breathing."""
         try:
             import edge_tts
@@ -1092,20 +1157,36 @@ class VoxCPMService:
                 candidates.append(alt_voice)
 
                 temp_mp3 = output_wav_path.replace(".wav", "_raw.mp3")
-                from utils.ffmpeg import extract_audio
 
                 for v in candidates:
-                    for attempt in range(5):
+                    max_attempts = 2 if v == edge_voice else 1
+                    for attempt in range(max_attempts):
                         try:
                             communicate = edge_tts.Communicate(
                                 text, v, rate=rate_str, pitch=pitch_str, volume="+0%",
-                                connect_timeout=15, receive_timeout=60
+                                connect_timeout=10, receive_timeout=30
                             )
                             await communicate.save(temp_mp3)
                             if os.path.exists(temp_mp3) and os.path.getsize(temp_mp3) > 100:
-                                extract_audio(temp_mp3, output_wav_path)
+                                if filter_chain:
+                                    cmd = [
+                                        "ffmpeg", "-y",
+                                        "-i", temp_mp3,
+                                        "-af", filter_chain,
+                                        "-ar", "44100",
+                                        "-ac", "2",
+                                        output_wav_path
+                                    ]
+                                    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                else:
+                                    from utils.ffmpeg import extract_audio
+                                    extract_audio(temp_mp3, output_wav_path)
+
                                 if os.path.exists(temp_mp3):
-                                    os.remove(temp_mp3)
+                                    try:
+                                        os.remove(temp_mp3)
+                                    except Exception:
+                                        pass
                                 if os.path.exists(output_wav_path) and os.path.getsize(output_wav_path) > 1000:
                                     raw_cache_path = get_temp_path(f"raw_tts_cache_{abs(hash(cache_key))}.wav")
                                     shutil.copy(output_wav_path, raw_cache_path)
@@ -1117,13 +1198,8 @@ class VoxCPMService:
                                     os.remove(temp_mp3)
                                 except Exception:
                                     pass
-                            err_str = str(e_att)
-                            is_dns_net = any(k in err_str for k in ("nodename", "servname", "Cannot connect", "ClientConnectorError", "TimeoutError", "gaierror"))
-                            backoff = min(6.0, (attempt + 1) * 1.2) if is_dns_net else (attempt + 1) * 0.5
-                            if is_dns_net:
-                                logger.warning(f"🌐 [Network/DNS Dropout] Edge-TTS attempt {attempt+1}/5 with {v} failed: {e_att}. Auto-reconnecting in {backoff:.1f}s...")
-                            else:
-                                logger.warning(f"Edge-TTS attempt {attempt+1}/5 with {v} failed ({e_att}), retrying in {backoff:.1f}s...")
+                            backoff = 0.4
+                            logger.warning(f"Edge-TTS attempt {attempt+1}/{max_attempts} with {v} notice ({e_att}), retrying in {backoff:.1f}s...")
                             await asyncio.sleep(backoff)
                 return False
 
@@ -1201,30 +1277,7 @@ class VoxCPMService:
         temp_path = audio_path.replace(".wav", "_unmastered.wav")
         shutil.copy(audio_path, temp_path)
 
-        filters = [
-            "highpass=f=70",
-            "equalizer=f=250:width_type=q:width=1.2:g=1.8",
-            "equalizer=f=3500:width_type=q:width=1.5:g=1.2",
-            "equalizer=f=7500:width_type=q:width=2.0:g=-2.5",
-        ]
-
-        if extra_filters:
-            for ef in extra_filters:
-                if ef:
-                    filters.append(ef)
-
-        filters.extend([
-            "acompressor=threshold=-14dB:ratio=2.5:attack=15:release=120",
-            "loudnorm=I=-14:TP=-1.0:LRA=7",
-            "volume=1.2"
-        ])
-
-        if apply_eq and ref_audio_path and os.path.exists(ref_audio_path):
-            ref_eq = self._analyze_reference_spectral_eq(ref_audio_path)
-            if ref_eq:
-                filters.insert(1, ref_eq)
-
-        filter_chain = ",".join(filters)
+        filter_chain = self._build_dsp_filter_chain(ref_audio_path=ref_audio_path, apply_eq=apply_eq, extra_filters=extra_filters)
 
         cmd = [
             "ffmpeg", "-y",

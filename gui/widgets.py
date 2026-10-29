@@ -500,12 +500,12 @@ class AudioWaveformCanvas(QWidget):
         self._thumb_loader = None
         self._wave_loader = None
 
-        self.text_clip = {"start": 0.0, "duration": 5.0, "text": "សង្សារមនុស្សល្អ...", "enabled": True}
+        self.text_clip = {"start": 0.0, "duration": 5.0, "text": "", "enabled": False}
         self.text_items = []
         self.active_text_id = None
         self.logo_clip = {"start": 0.0, "duration": 60.0, "name": "Logo", "enabled": False, "full_video": True}
-        self.blur_auto_speech = True
-        self.blur_enabled = True
+        self.blur_auto_speech = False
+        self.blur_enabled = False
         self.blur_items = []
         self.active_blur_id = None
         
@@ -668,6 +668,14 @@ class AudioWaveformCanvas(QWidget):
         if video_path is not None:
             self.video_path = video_path
         self.video_clips = list(clips or [])
+        if self.video_clips:
+            from utils.file_utils import resolve_existing_media_path
+            for c in self.video_clips:
+                cp = c.get("path", "")
+                if cp and not os.path.exists(cp):
+                    healed = resolve_existing_media_path(cp, self.video_clips)
+                    if healed and os.path.exists(healed):
+                        c["path"] = healed
         if not hasattr(self, '_clip_thumbnails'):
             self._clip_thumbnails = {}
         if not hasattr(self, '_thumbnails'):
@@ -2812,6 +2820,8 @@ class SubtitleTableWidget(QWidget):
     cancel_voices_requested = Signal()
     subtitle_style_changed = Signal(str)
     gemini_ai_requested = Signal()
+    detect_speech_requested = Signal()
+    translate_table_requested = Signal()
     paste_srt_requested = Signal()
     export_srt_requested = Signal()
     export_khmer_srt_requested = Signal()
@@ -2820,6 +2830,8 @@ class SubtitleTableWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.segments = []
+        self._undo_stack = []
+        self._redo_stack = []
         self.clone_voice_samples = {}
         self._init_ui()
 
@@ -2860,8 +2872,8 @@ class SubtitleTableWidget(QWidget):
         row1.setContentsMargins(0, 0, 0, 0)
         row1.setSpacing(6)
 
-        # 1. AI Subtitle Generation
-        self.gemini_ai_btn = QPushButton("✨ Auto Subtitle", self)
+        # 1. AI Subtitle Generation with Step-by-Step Dropdown Menu
+        self.gemini_ai_btn = QPushButton("✨ Auto Subtitle ▼", self)
         self.gemini_ai_btn.setStyleSheet("""
             QPushButton {
                 background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #1d4ed8, stop:0.5 #2563eb, stop:1 #06b6d4);
@@ -2876,8 +2888,37 @@ class SubtitleTableWidget(QWidget):
                 background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #2563eb, stop:1 #0891b2);
             }
         """)
-        self.gemini_ai_btn.setToolTip("បង្កើតអក្សររត់ និងបកប្រែជាភាសាខ្មែរតាម Gemini AI ចូលក្នុងតារាង (Auto Subtitle Generation)")
-        self.gemini_ai_btn.clicked.connect(self.gemini_ai_requested.emit)
+        self.gemini_ai_btn.setToolTip("ចុចដើម្បីដំណើរការស្វ័យប្រវត្តិ ឬជ្រើសរើសធ្វើមួយជំហានៗ (STT / Translate)")
+
+        sub_menu = QMenu(self.gemini_ai_btn)
+        sub_menu.setStyleSheet("""
+            QMenu {
+                background-color: #0b1120;
+                color: #f8fafc;
+                border: 1px solid #1e293b;
+                border-radius: 8px;
+                padding: 6px;
+                font-size: 12px;
+            }
+            QMenu::item {
+                padding: 6px 18px 6px 10px;
+                border-radius: 4px;
+            }
+            QMenu::item:selected {
+                background-color: #1e3a8a;
+                color: #38bdf8;
+            }
+            QMenu::separator {
+                height: 1px;
+                background-color: #1e293b;
+                margin: 4px 0;
+            }
+        """)
+        sub_menu.addAction("✨ ដំណើរការពេញលេញ (STT + Translate All)", self.gemini_ai_requested.emit)
+        sub_menu.addSeparator()
+        sub_menu.addAction("🎙️ 1. Detect Speech Only (Faster-Whisper STT)", self.detect_speech_requested.emit)
+        sub_menu.addAction("🌐 2. Translate Table to Khmer (Gemini AI)", self.translate_table_requested.emit)
+        self.gemini_ai_btn.setMenu(sub_menu)
         row1.addWidget(self.gemini_ai_btn)
 
         # 2. Voice Generation
@@ -3400,6 +3441,57 @@ class SubtitleTableWidget(QWidget):
                 if et_item:
                     et_item.setText(f"{end_sec:.2f}s")
 
+    def _save_undo_state(self):
+        """Push current segments state to undo stack for Cmd+Z recovery."""
+        if self.segments:
+            self._undo_stack.append([dict(s) for s in self.segments])
+            if len(self._undo_stack) > 50:
+                self._undo_stack.pop(0)
+
+    def undo(self):
+        """Restore previous subtitle segments state (Cmd+Z)."""
+        if not self._undo_stack:
+            return
+        self._redo_stack.append([dict(s) for s in self.segments])
+        prev_segs = self._undo_stack.pop()
+        self.set_segments(prev_segs)
+        self.segments_changed.emit(self.segments)
+
+    def redo(self):
+        """Reapply redone subtitle segments state (Cmd+Shift+Z / Cmd+Y)."""
+        if not self._redo_stack:
+            return
+        self._undo_stack.append([dict(s) for s in self.segments])
+        next_segs = self._redo_stack.pop()
+        self.set_segments(next_segs)
+        self.segments_changed.emit(self.segments)
+
+    def keyPressEvent(self, event):
+        is_undo = (event.key() == Qt.Key_Z and (event.modifiers() & Qt.ControlModifier or event.modifiers() & Qt.MetaModifier) and not (event.modifiers() & Qt.ShiftModifier))
+        is_redo = ((event.key() == Qt.Key_Y and (event.modifiers() & Qt.ControlModifier or event.modifiers() & Qt.MetaModifier)) or 
+                   (event.key() == Qt.Key_Z and (event.modifiers() & Qt.ControlModifier or event.modifiers() & Qt.MetaModifier) and (event.modifiers() & Qt.ShiftModifier)))
+        if is_undo:
+            self.undo()
+            event.accept()
+            return
+        elif is_redo:
+            self.redo()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def update_segment_text(self, seg_idx: int, text: str):
+        """Update subtitle text dynamically from on-screen direct edit."""
+        if 0 <= seg_idx < len(self.segments):
+            self._save_undo_state()
+            self.segments[seg_idx]["khmer_text"] = text
+            self.segments[seg_idx]["translated_text"] = text
+            if seg_idx < self.table.rowCount():
+                text_item = self.table.item(seg_idx, 6)
+                if text_item:
+                    text_item.setText(text)
+            self.segments_changed.emit(self.segments)
+
     def get_updated_segments(self) -> list:
         updated = []
         for i in range(self.table.rowCount()):
@@ -3429,20 +3521,41 @@ class SubtitleTableWidget(QWidget):
             orig_text = orig_seg.get("original_text", orig_seg.get("text", curr_text))
             spk_id = orig_seg.get("speaker_id") or orig_seg.get("speaker") or f"speaker_{1 + (i % 2):02d}"
 
-            seg_obj = Segment(
-                id=str(orig_seg.get("id", i + 1)),
-                start=st,
-                end=et,
-                speaker_id=spk_id,
-                persona=persona,
-                emotion=emotion,
-                speaking_style=style,
-                original_text=orig_text,
-                translated_text=curr_text,
-                voice_id=voice,
-                tts_audio=orig_seg.get("tts_audio")
-            )
-            updated.append(seg_obj.to_dict())
+            orig_copy = dict(orig_seg) if isinstance(orig_seg, dict) else (orig_seg.to_dict() if hasattr(orig_seg, "to_dict") else {})
+            has_khmer = any(0x1780 <= ord(c) <= 0x17FF for c in curr_text)
+            
+            # Combine table edits with full preservation of metadata
+            merged_dict = {
+                **orig_copy,
+                "id": str(orig_seg.get("id", i + 1)),
+                "start": st,
+                "end": et,
+                "speaker_id": spk_id,
+                "speaker": spk_id,
+                "speaker_tag": orig_seg.get("speaker_tag"),
+                "speaker_role": orig_seg.get("speaker_role"),
+                "persona": persona,
+                "character": persona,
+                "emotion": emotion,
+                "speaking_style": style,
+                "style": style,
+                "source_language": orig_seg.get("source_language", "auto"),
+                "original_text": orig_text,
+                "text": orig_text,
+                "target_language": orig_seg.get("target_language", "km"),
+                "translated_text": curr_text,
+                "khmer_text": curr_text,
+                "voice_id": voice,
+                "voice": voice,
+                "tts_audio": orig_seg.get("tts_audio"),
+                "tts_duration": orig_seg.get("tts_duration", 0.0),
+                "slot_duration": orig_seg.get("slot_duration", round(et - st, 2)),
+                "sync_rate": orig_seg.get("sync_rate", 1.0),
+                "status": orig_seg.get("status", "ready"),
+                "translation_status": "translated" if has_khmer else orig_seg.get("translation_status", "pending"),
+                "tts_status": orig_seg.get("tts_status", "pending")
+            }
+            updated.append(merged_dict)
         return updated
 
     # ==================== VOICE PROMPT DESIGNER DIALOG ====================
@@ -4745,6 +4858,7 @@ class VideoPreviewWidget(QWidget):
     mark_in_requested = Signal(float)
     mark_out_requested = Signal(float)
     cut_requested = Signal(float)
+    subtitle_edited_on_screen = Signal(int, str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -4963,6 +5077,7 @@ class VideoPreviewWidget(QWidget):
         self.screen_frame.mousePressEvent = lambda ev: self._on_mouse_press(ev, self.screen_frame)
         self.screen_frame.mouseMoveEvent = lambda ev: self._on_mouse_move(ev, self.screen_frame)
         self.screen_frame.mouseReleaseEvent = lambda ev: self._on_mouse_release(ev, self.screen_frame)
+        self.screen_frame.mouseDoubleClickEvent = lambda ev: self._on_screen_double_click(ev, self.screen_frame)
         self.screen_frame.dragEnterEvent = self._on_screen_drag_enter
         self.screen_frame.dragMoveEvent = self._on_screen_drag_move
         self.screen_frame.dropEvent = lambda ev: self._on_screen_drop(ev, self.screen_frame)
@@ -4971,6 +5086,7 @@ class VideoPreviewWidget(QWidget):
         self.placeholder_lbl.mousePressEvent = lambda ev: self._on_mouse_press(ev, self.placeholder_lbl)
         self.placeholder_lbl.mouseMoveEvent = lambda ev: self._on_mouse_move(ev, self.placeholder_lbl)
         self.placeholder_lbl.mouseReleaseEvent = lambda ev: self._on_mouse_release(ev, self.placeholder_lbl)
+        self.placeholder_lbl.mouseDoubleClickEvent = lambda ev: self._on_screen_double_click(ev, self.placeholder_lbl)
         self.placeholder_lbl.dragEnterEvent = self._on_screen_drag_enter
         self.placeholder_lbl.dragMoveEvent = self._on_screen_drag_move
         self.placeholder_lbl.dropEvent = lambda ev: self._on_screen_drop(ev, self.placeholder_lbl)
@@ -4989,6 +5105,12 @@ class VideoPreviewWidget(QWidget):
         ctrl_lay.setContentsMargins(4, 2, 4, 2)
         ctrl_lay.setSpacing(4)
 
+        self.rewind_btn = QPushButton("⏮", self)
+        self.rewind_btn.setFixedSize(28, 28)
+        self.rewind_btn.setProperty("class", "btn-secondary")
+        self.rewind_btn.setToolTip("Go to Start / Reset to 00:00 (Home)")
+        self.rewind_btn.clicked.connect(lambda: self._stop_video(reset_to_start=True))
+
         self.play_btn = QPushButton("▶", self)
         self.play_btn.setFixedSize(32, 28)
         self.play_btn.setProperty("class", "btn-green")
@@ -4996,14 +5118,15 @@ class VideoPreviewWidget(QWidget):
         self.play_btn.clicked.connect(self._toggle_play)
         
         self.stop_btn = QPushButton("⏹", self)
-        self.stop_btn.setFixedSize(32, 28)
+        self.stop_btn.setFixedSize(28, 28)
         self.stop_btn.setProperty("class", "btn-red")
-        self.stop_btn.setToolTip("Stop")
-        self.stop_btn.clicked.connect(self._stop_video)
+        self.stop_btn.setToolTip("Stop in place (Pause)")
+        self.stop_btn.clicked.connect(lambda: self._stop_video(reset_to_start=False))
 
         self.time_lbl = QLabel("00:00 / 00:00", self)
         self.time_lbl.setStyleSheet("font-family: Menlo, monospace; font-size: 11px; font-weight: bold; color: #94a3b8;")
 
+        ctrl_lay.addWidget(self.rewind_btn)
         ctrl_lay.addWidget(self.play_btn)
         ctrl_lay.addWidget(self.stop_btn)
         ctrl_lay.addWidget(self.time_lbl)
@@ -5408,8 +5531,12 @@ class VideoPreviewWidget(QWidget):
         target_clip = self.video_clips[clip_idx]
         p = os.path.abspath(target_clip.get("path", ""))
         if not p or not os.path.exists(p):
-            logger.error(f"❌ [VideoPreview] Clip {clip_idx} path invalid: {p}")
-            return False
+            from utils.file_utils import resolve_existing_media_path
+            p = resolve_existing_media_path(p, self.video_clips)
+            if not p or not os.path.exists(p):
+                logger.error(f"❌ [VideoPreview] Clip {clip_idx} path invalid: {p}")
+                return False
+            target_clip["path"] = p
 
         if getattr(self, '_active_clip_idx', None) == clip_idx and self.cap and self.cap.isOpened():
             return True
@@ -5622,8 +5749,11 @@ class VideoPreviewWidget(QWidget):
     def set_video_path(self, video_path: str, preserve_playback: bool = False) -> bool:
         """Set loaded video path, initialize OpenCV VideoCapture & render frame 0 instantly."""
         if not video_path or not os.path.exists(video_path):
-            logger.error(f"❌ Video path is invalid or does not exist: {video_path}")
-            return False
+            from utils.file_utils import resolve_existing_media_path
+            video_path = resolve_existing_media_path(video_path, getattr(self, 'video_clips', None))
+            if not video_path or not os.path.exists(video_path):
+                logger.error(f"❌ Video path is invalid or does not exist: {video_path}")
+                return False
 
         abs_path = os.path.abspath(video_path)
         self.video_path = abs_path
@@ -5672,6 +5802,14 @@ class VideoPreviewWidget(QWidget):
         """Set multi-clip virtual sequence composition for seamless CapCut-style playback."""
         self.video_clips = list(clips or [])
         if self.video_clips:
+            from utils.file_utils import resolve_existing_media_path
+            for c in self.video_clips:
+                cp = c.get("path", "")
+                if cp and not os.path.exists(cp):
+                    healed = resolve_existing_media_path(cp, self.video_clips)
+                    if healed and os.path.exists(healed):
+                        c["path"] = healed
+
             tot = sum(c.get("duration", 0.0) for c in self.video_clips)
             cur_global = getattr(self, '_current_global_sec', 0.0)
             clip_idx, clip, local_sec = self.resolve_clip_at_time(cur_global)
@@ -5937,6 +6075,48 @@ class VideoPreviewWidget(QWidget):
                 return ("burn_subtitle", "move", None)
 
         return (None, None, None)
+
+    def _on_screen_double_click(self, event, source_widget=None):
+        """CapCut Direct On-Screen Subtitle Editing: Double-click to edit subtitle in-place."""
+        if not self._timeline_segments:
+            return
+
+        cur_sec = self._current_global_sec if hasattr(self, '_current_global_sec') else 0.0
+        active_seg = None
+        active_idx = -1
+        for idx, seg in enumerate(self._timeline_segments):
+            st = seg.get("start", 0.0)
+            et = seg.get("end", 0.0)
+            if st <= cur_sec <= et:
+                active_seg = seg
+                active_idx = idx
+                break
+
+        if not active_seg and self._timeline_segments:
+            closest_idx = min(range(len(self._timeline_segments)), key=lambda i: abs(self._timeline_segments[i].get("start", 0.0) - cur_sec))
+            if abs(self._timeline_segments[closest_idx].get("start", 0.0) - cur_sec) <= 2.5:
+                active_seg = self._timeline_segments[closest_idx]
+                active_idx = closest_idx
+
+        if not active_seg:
+            return
+
+        curr_text = active_seg.get("khmer_text") or active_seg.get("original_text") or active_seg.get("text", "")
+        from qt_compat import QInputDialog, QLineEdit
+        new_text, ok = QInputDialog.getText(
+            self,
+            "✏️ កែសម្រួល Subtitle ផ្ទាល់ (CapCut Direct Edit)",
+            f"កែអត្ថបទ Subtitle [{active_seg.get('start', 0.0):.1f}s - {active_seg.get('end', 0.0):.1f}s]:",
+            QLineEdit.Normal,
+            curr_text
+        )
+        if ok and new_text is not None:
+            active_seg["khmer_text"] = new_text.strip()
+            active_seg["translated_text"] = new_text.strip()
+            if hasattr(self, '_sub_render_cache'):
+                self._sub_render_cache.clear()
+            self._update_display()
+            self.subtitle_edited_on_screen.emit(active_idx, new_text.strip())
 
     def _on_mouse_press(self, event, source_widget=None):
         if event.button() == Qt.RightButton:
@@ -6210,8 +6390,14 @@ class VideoPreviewWidget(QWidget):
         if event.modifiers() & (Qt.ControlModifier | Qt.MetaModifier) and event.key() == Qt.Key_D:
             if self.active_blur_id:
                 self.duplicate_blur(self.active_blur_id)
-                event.accept()
-                return
+        if event.key() == Qt.Key_Home:
+            self._stop_video(reset_to_start=True)
+            event.accept()
+            return
+        if event.key() == Qt.Key_Space and not event.isAutoRepeat():
+            self._toggle_play()
+            event.accept()
+            return
         super().keyPressEvent(event)
 
     # ==================== MULTI-BLUR FUNCTIONS ====================
@@ -7881,7 +8067,22 @@ class VideoPreviewWidget(QWidget):
             self.play_btn.setText("▶")
             logger.info("⏸ [VideoPreview] Playback paused.")
         else:
-            if hasattr(self.player, 'source') and self.player.source().isEmpty():
+            # Robust Audio Sync: verify player audio matches selected track
+            combo_idx = self.audio_track_combo.currentIndex() if hasattr(self, 'audio_track_combo') else 1
+            main_win = self.window()
+            last_master = getattr(main_win, 'last_master_wav', None)
+            from utils.file_utils import get_temp_path
+            default_master = get_temp_path("master_khmer_voice.wav")
+            has_khmer = (last_master and os.path.exists(last_master) and os.path.getsize(last_master) > 1000) or \
+                        (os.path.exists(default_master) and os.path.getsize(default_master) > 1000)
+            
+            curr_src = str(self.player.source().toString()) if hasattr(self, 'player') and hasattr(self.player, 'source') else ""
+            if combo_idx in (1, 2) and has_khmer:
+                if "preview_khmer_mixed" not in curr_src and "master_khmer" not in curr_src:
+                    self._load_audio_for_player()
+            elif combo_idx == 0 and ("preview_khmer_mixed" in curr_src or "master_khmer" in curr_src):
+                self._load_audio_for_player()
+            elif hasattr(self.player, 'source') and self.player.source().isEmpty():
                 self._load_audio_for_player()
 
             import time
@@ -7939,7 +8140,7 @@ class VideoPreviewWidget(QWidget):
         if self._is_playing:
             self._toggle_play()
 
-    def _stop_video(self):
+    def _stop_video(self, reset_to_start: bool = False):
         if hasattr(self, '_dual_decoder') and self._dual_decoder:
             try:
                 self._dual_decoder.close()
@@ -7952,16 +8153,28 @@ class VideoPreviewWidget(QWidget):
             except Exception:
                 pass
         self.play_timer.stop()
-        self.player.stop()
-        try:
-            self.player.setPosition(0)
-        except Exception:
-            pass
+        self.player.pause()
         self._is_playing = False
+        self._pending_play = False
         self.play_btn.setText("▶")
-        self._current_global_sec = 0.0
-        self.seek_to_time_sec(0.0, immediate=True)
-        self.playhead_moved.emit(0.0)
+
+        if reset_to_start:
+            self._current_global_sec = 0.0
+            try:
+                self.player.setPosition(0)
+            except Exception:
+                pass
+            self.seek_to_time_sec(0.0, immediate=True)
+            self.playhead_moved.emit(0.0)
+        else:
+            # Professional NLE behavior: Stop in place (maintain current frame & position)
+            cur_sec = getattr(self, '_current_global_sec', 0.0)
+            try:
+                self.player.setPosition(int(cur_sec * 1000))
+            except Exception:
+                pass
+            self.seek_to_time_sec(cur_sec, immediate=True)
+            self.playhead_moved.emit(cur_sec)
 
     def _try_render_transition_frame(self, target_global_sec: float):
         """Phase 3 live OpenCV transition rendering during preview playback and scrubbing."""
@@ -10296,7 +10509,7 @@ class VideoEffectsWidget(QWidget):
         t_row1.setSpacing(8)
 
         self.text_checkbox = QCheckBox("Enable", self)
-        self.text_checkbox.setChecked(True)
+        self.text_checkbox.setChecked(False)
         self.text_checkbox.setStyleSheet("font-weight: 700; color: #38bdf8; font-size: 11px;")
         self.text_checkbox.setToolTip("បើក/បិទ Text Overlay លើវីដេអូ")
         self.text_checkbox.toggled.connect(self._on_text_toggled)
@@ -10311,7 +10524,7 @@ class VideoEffectsWidget(QWidget):
         lbl_text.setStyleSheet("color: #94a3b8; font-weight: 600; font-size: 11px;")
         t_row1.addWidget(lbl_text)
 
-        self.text_input = QLineEdit("ai 24 movei", self)
+        self.text_input = QLineEdit("", self)
         self.text_input.setMinimumWidth(180)
         self.text_input.setPlaceholderText("បញ្ចូលអក្សរចំណងជើងនៅទីនេះ...")
         self.text_input.setStyleSheet("""
@@ -10822,7 +11035,7 @@ class VideoEffectsWidget(QWidget):
         burn_lay.setSpacing(8)
 
         self.burn_sub_checkbox = QCheckBox("Enable", self)
-        self.burn_sub_checkbox.setChecked(True)
+        self.burn_sub_checkbox.setChecked(False)
         self.burn_sub_checkbox.toggled.connect(self._on_burn_sub_toggled)
         burn_lay.addWidget(self.burn_sub_checkbox)
 
@@ -11984,11 +12197,8 @@ class VideoEffectsWidget(QWidget):
             return default
 
         # ---------------- 1. BLUR MASK ----------------
-        blur_enabled = (
-            self.blur_checkbox.isChecked()
-            or (preview_widget and getattr(preview_widget, 'blur_enabled', False))
-        )
-        if preview_widget and getattr(preview_widget, 'blur_items', None) and getattr(preview_widget, 'blur_enabled', False):
+        blur_enabled = self.blur_checkbox.isChecked()
+        if not blur_enabled and preview_widget and getattr(preview_widget, 'blur_enabled', False) and getattr(preview_widget, 'blur_items', None):
             blur_enabled = True
 
         blurs = []
@@ -14091,6 +14301,214 @@ class GeminiApiKeyDialog(QDialog):
             QMessageBox.critical(self, "Error", "មិនអាចរក្សាទុក API Key បានទេ។")
 
 
+# ==================== 1-CLICK AUTO DUB SETUP DIALOG ====================
+class AutoDubSetupDialog(QDialog):
+    """
+    1-Click Auto Dub Setup Dialog:
+    - Select Target Output Folder (with '📁 Browse...' button)
+    - Choose Post-Dubbing Workflow:
+        1. [●] Review & Customize Effects First (Recommended: Dubs -> Loads to Timeline -> Opens Effects Tab)
+        2. [○] Direct Instant Export (Dubs -> Directly Exports MP4 to chosen folder)
+    - Choose Resolution & Speed profile
+    """
+    def __init__(self, parent=None, output_dir: str = "", video_path: str = ""):
+        super().__init__(parent)
+        self.setWindowTitle("🚀 1-Click Auto Dub Setup")
+        self.setFixedSize(540, 440)
+        self.output_dir = output_dir or os.path.abspath("output")
+        self.video_path = video_path or ""
+        self._init_ui()
+
+    def _init_ui(self):
+        self.setStyleSheet("""
+            QDialog {
+                background-color: #121316;
+                color: #e2e8f0;
+                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            }
+            QLabel {
+                color: #e2e8f0;
+                font-size: 12px;
+            }
+            QLineEdit {
+                background-color: #1e2025;
+                color: #f8fafc;
+                border: 1px solid #2e323b;
+                border-radius: 6px;
+                padding: 6px 10px;
+                font-size: 12px;
+            }
+            QComboBox {
+                background-color: #1e2025;
+                color: #f8fafc;
+                border: 1px solid #2e323b;
+                border-radius: 6px;
+                padding: 5px 10px;
+                font-size: 12px;
+            }
+            QRadioButton {
+                color: #f1f5f9;
+                font-size: 12px;
+                font-weight: 700;
+                spacing: 8px;
+            }
+            QRadioButton::indicator {
+                width: 15px;
+                height: 15px;
+                border-radius: 8px;
+                border: 2px solid #64748b;
+                background: #1e2025;
+            }
+            QRadioButton::indicator:checked {
+                border: 2px solid #00d2d2;
+                background: #00d2d2;
+            }
+            QPushButton {
+                border-radius: 6px;
+                font-weight: 700;
+                font-size: 12px;
+                padding: 8px 16px;
+            }
+        """)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 20, 24, 20)
+        layout.setSpacing(14)
+
+        # Header Title
+        header_lay = QVBoxLayout()
+        header_lay.setSpacing(4)
+        title_lbl = QLabel("🚀 1-Click Auto Dub Studio")
+        title_lbl.setStyleSheet("font-size: 17px; font-weight: 800; color: #00d2d2;")
+        sub_title = QLabel("ដំណើរការស្វ័យប្រវត្តិតាំងពីចាប់សំឡេង បកប្រែ សំយោគសំឡេង រហូតដល់ Export")
+        sub_title.setStyleSheet("font-size: 11px; color: #94a3b8;")
+        header_lay.addWidget(title_lbl)
+        header_lay.addWidget(sub_title)
+        layout.addLayout(header_lay)
+
+        # Divider
+        div = QFrame()
+        div.setFrameShape(QFrame.HLine)
+        div.setStyleSheet("background-color: #22252b; max-height: 1px;")
+        layout.addWidget(div)
+
+        # Folder Picker Section
+        folder_lbl = QLabel("📁 ទីតាំង Folder សម្រាប់ Save វីដេអូសម្រេច (Output Destination):")
+        folder_lbl.setStyleSheet("font-weight: 700; color: #38bdf8;")
+        layout.addWidget(folder_lbl)
+
+        folder_row = QHBoxLayout()
+        folder_row.setSpacing(8)
+        self.folder_edit = QLineEdit(self.output_dir)
+        self.folder_edit.setReadOnly(True)
+        folder_row.addWidget(self.folder_edit)
+
+        browse_btn = QPushButton("Browse...")
+        browse_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #252830;
+                color: #e2e8f0;
+                border: 1px solid #383c48;
+            }
+            QPushButton:hover {
+                background-color: #323642;
+            }
+        """)
+        browse_btn.clicked.connect(self._browse_dir)
+        folder_row.addWidget(browse_btn)
+        layout.addLayout(folder_row)
+
+        # Workflow Choice Section
+        flow_lbl = QLabel("⚙️ របៀបបញ្ចប់ការងារ (Post-Dubbing Workflow):")
+        flow_lbl.setStyleSheet("font-weight: 700; color: #f59e0b; margin-top: 4px;")
+        layout.addWidget(flow_lbl)
+
+        # Radio 1: Review Effects First
+        self.radio_review = QRadioButton("🎨 កែសម្រួល Effects សិនមុននឹង Export (Review & Customize Effects First)")
+        self.radio_review.setChecked(True)
+        layout.addWidget(self.radio_review)
+
+        review_desc = QLabel("   AI នឹងបញ្ចូលសំឡេងខ្មែរត្រូវមាត់រួចរាល់ ហើយបើកផ្ទាំង Effects ឱ្យលោកអ្នកកែសម្រួល\n   Blur, Logo, Subtitles រួចចុច 'Export Final Video' ដោយខ្លួនឯង (ណែនាំ)")
+        review_desc.setStyleSheet("color: #94a3b8; font-size: 11px; margin-left: 18px;")
+        layout.addWidget(review_desc)
+
+        # Radio 2: Direct Instant Export
+        self.radio_direct = QRadioButton("⚡ Export វីដេអូដោយស្វ័យប្រវត្តិភ្លាមៗ (Direct Instant Export)")
+        layout.addWidget(self.radio_direct)
+
+        direct_desc = QLabel("   AI នឹងរត់ចប់សព្វគ្រប់ ហើយ Export ជា MP4 ទៅកាន់ Folder ខាងលើភ្លាមៗដោយមិនបាច់រង់ចាំ។")
+        direct_desc.setStyleSheet("color: #94a3b8; font-size: 11px; margin-left: 18px;")
+        layout.addWidget(direct_desc)
+
+        # Resolution Selection Row
+        res_row = QHBoxLayout()
+        res_lbl = QLabel("📺 Resolution:")
+        res_lbl.setStyleSheet("color: #cbd5e1; font-weight: 600;")
+        self.res_combo = QComboBox()
+        self.res_combo.addItems(["Match Source (Original)", "1080p Full HD (1920x1080)", "720p HD (1280x720)"])
+        res_row.addWidget(res_lbl)
+        res_row.addWidget(self.res_combo)
+        res_row.addStretch()
+
+        hw_lbl = QLabel("⚡ Apple Silicon VideoToolbox")
+        hw_lbl.setStyleSheet("color: #34d399; font-size: 11px; font-weight: 700;")
+        res_row.addWidget(hw_lbl)
+        layout.addLayout(res_row)
+
+        layout.addStretch()
+
+        # Action Buttons
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(10)
+
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #262930;
+                color: #94a3b8;
+                border: 1px solid #373b45;
+            }
+            QPushButton:hover {
+                background-color: #333742;
+                color: #e2e8f0;
+            }
+        """)
+        cancel_btn.clicked.connect(self.reject)
+        btn_row.addWidget(cancel_btn)
+
+        start_btn = QPushButton("🚀 Start Auto Dub")
+        start_btn.setStyleSheet("""
+            QPushButton {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #00b8b8, stop:1 #0284c7);
+                color: #ffffff;
+                font-weight: 800;
+                font-size: 13px;
+                border: none;
+                padding: 10px 24px;
+            }
+            QPushButton:hover {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #00d2d2, stop:1 #0369a1);
+            }
+        """)
+        start_btn.clicked.connect(self.accept)
+        btn_row.addWidget(start_btn)
+
+        layout.addLayout(btn_row)
+
+    def _browse_dir(self):
+        d = QFileDialog.getExistingDirectory(self, "ជ្រើសរើស Folder សម្រាប់ Save វីដេអូសម្រេច", self.folder_edit.text())
+        if d:
+            self.output_dir = d
+            self.folder_edit.setText(d)
+
+    def get_settings(self):
+        return {
+            "output_dir": self.output_dir,
+            "review_effects_first": self.radio_review.isChecked(),
+            "resolution": self.res_combo.currentText()
+        }
+
+
 # ==================== EXPORT VIDEO SETTINGS DIALOG ====================
 class ExportSettingsDialog(QDialog):
     """
@@ -14119,23 +14537,25 @@ class ExportSettingsDialog(QDialog):
         self,
         parent=None,
         video_path: str = "",
-        initial_res: str = "1080P",
-        initial_mode: str = "Balanced",
+        initial_res: str = "Original",
+        initial_mode: str = "Fast",
         initial_bgm: int = 30,
         story_folder: str = "My_Story",
         episode: int = 1,
         output_dir: str = "",
-        timeline_name: str = "Timeline 01"
+        timeline_name: str = "Timeline 01",
+        initial_burn_sub: bool = True
     ):
         super().__init__(parent)
         self.video_path = video_path or ""
-        self.initial_res = initial_res or "1080P"
-        self.initial_mode = initial_mode or "Balanced"
+        self.initial_res = initial_res or "Original"
+        self.initial_mode = initial_mode or "Fast"
         self.initial_bgm = initial_bgm if initial_bgm is not None else 30
         self.story_folder = story_folder or "My_Story"
         self.episode = episode or 1
         self.output_dir = output_dir or os.path.abspath("output")
         self.timeline_name = timeline_name or "Timeline 01"
+        self.initial_burn_sub = bool(initial_burn_sub)
 
         # Determine default project name
         base_name = os.path.splitext(os.path.basename(self.video_path))[0] if self.video_path else time.strftime("%m%d (1)")
@@ -14425,16 +14845,18 @@ class ExportSettingsDialog(QDialog):
         res_lbl.setStyleSheet("color: #88909c; font-size: 11px;")
         self.res_combo = QComboBox(vid_sec)
         self.res_combo.addItems([
+            "Original",
             "1080P",
             "4K",
             "2K",
             "720P",
-            "480P",
-            "Original"
+            "480P"
         ])
         # Select initial res
         c_init = self.initial_res.upper()
-        if "4K" in c_init or "3840" in c_init:
+        if "ORIG" in c_init:
+            self.res_combo.setCurrentText("Original")
+        elif "4K" in c_init or "3840" in c_init:
             self.res_combo.setCurrentText("4K")
         elif "2K" in c_init or "2560" in c_init:
             self.res_combo.setCurrentText("2K")
@@ -14442,10 +14864,10 @@ class ExportSettingsDialog(QDialog):
             self.res_combo.setCurrentText("720P")
         elif "480" in c_init:
             self.res_combo.setCurrentText("480P")
-        elif "ORIG" in c_init:
-            self.res_combo.setCurrentText("Original")
-        else:
+        elif "1080" in c_init:
             self.res_combo.setCurrentText("1080P")
+        else:
+            self.res_combo.setCurrentText("Original")
         self.res_combo.currentIndexChanged.connect(self._update_estimates)
         v_grid.addWidget(res_lbl, 1, 0)
         v_grid.addWidget(self.res_combo, 1, 1)
@@ -14495,6 +14917,15 @@ class ExportSettingsDialog(QDialog):
         v_grid.addWidget(cs_lbl, 6, 0)
         v_grid.addWidget(cs_val, 6, 1)
 
+        # Burn Subtitle into video (Row 7)
+        burn_lbl = QLabel("Burn subtitles 🔥", vid_sec)
+        burn_lbl.setStyleSheet("color: #88909c; font-size: 11px;")
+        self.burn_sub_chk = QCheckBox(vid_sec)
+        self.burn_sub_chk.setChecked(self.initial_burn_sub)
+        self.burn_sub_chk.setToolTip("ដុតអក្សររត់ជាប់លើសាច់វីដេអូ (Hardcode Subtitles):\n- ធីក (Default): ដុតអក្សររត់ជាប់លើសាច់វីដេអូ ក្នុងល្បឿនលឿន (140-170 FPS ជាមួយ Apple M2 SIMD Acceleration)។")
+        v_grid.addWidget(burn_lbl, 7, 0)
+        v_grid.addWidget(self.burn_sub_chk, 7, 1, Qt.AlignLeft)
+
         v_sec_lay.addLayout(v_grid)
         right_col.addWidget(vid_sec)
 
@@ -14509,6 +14940,18 @@ class ExportSettingsDialog(QDialog):
         sync_box.addWidget(self.sync_chk)
         sync_box.addWidget(sync_sub)
         right_col.addLayout(sync_box)
+
+        # Auto-cleanup intermediate files checkbox
+        cleanup_box = QVBoxLayout()
+        cleanup_box.setSpacing(2)
+        self.cleanup_chk = QCheckBox("🧹 Auto-clean scratch audio & subtitles after export", self)
+        self.cleanup_chk.setChecked(True)
+        self.cleanup_chk.setToolTip("Automatically delete temporary TTS clips, merged videos, and draft subtitles upon successful export to free up disk space.")
+        cleanup_sub = QLabel("Saves GBs of Mac disk storage by removing intermediate files automatically.", self)
+        cleanup_sub.setStyleSheet("color: #00b8b8; font-size: 10px; margin-left: 24px;")
+        cleanup_box.addWidget(self.cleanup_chk)
+        cleanup_box.addWidget(cleanup_sub)
+        right_col.addLayout(cleanup_box)
 
         right_col.addStretch()
         body_lay.addLayout(right_col, 1)
@@ -14670,7 +15113,9 @@ class ExportSettingsDialog(QDialog):
             "codec": self.codec_combo.currentText(),
             "fps": self.fps_combo.currentText(),
             "remove_watermark": self.remove_wm_chk.isChecked(),
-            "sync_space": self.sync_chk.isChecked()
+            "burn_subtitles": self.burn_sub_chk.isChecked() if hasattr(self, 'burn_sub_chk') else False,
+            "sync_space": self.sync_chk.isChecked(),
+            "auto_clean": self.cleanup_chk.isChecked()
         }
 
 
@@ -15174,6 +15619,8 @@ class MultiVideoMergerDialog(QDialog):
                 "height": h,
                 "size_mb": size_mb
             })
+            from qt_compat import QApplication
+            QApplication.processEvents()
 
     def _init_ui(self):
         self.setStyleSheet("""

@@ -163,7 +163,8 @@ def validate_and_clean_segments(
         if not src and not trans:
             continue
 
-        valid_segments.append({
+        valid_dict = dict(item)
+        valid_dict.update({
             "id": str(item_id),
             "start": round(st, 2),
             "end": round(et, 2),
@@ -175,6 +176,7 @@ def validate_and_clean_segments(
             "speaker": spk or "Speaker 1",
             "gender": gender
         })
+        valid_segments.append(valid_dict)
 
     return valid_segments
 
@@ -278,11 +280,26 @@ def parse_gemini_json_response(
     except json.JSONDecodeError as e:
         last_decode_err = e
 
+    # ==================== STAGE 4.5: MISSING STRING QUOTES REPAIR ====================
+    # Fixes missing opening quote: "key":text without opening quote", -> "key": "text without opening quote",
+    repaired_quotes = re.sub(r':\s*([^\s"\{\[\d\-\+tfn][^"\n\r]*)"\s*([,\}\n\r])', r': "\1"\2', repaired_single)
+    # Fixes completely unquoted string value: "key": unquoted_text, -> "key": "unquoted_text",
+    repaired_quotes = re.sub(r':\s*([^\s"\{\[\d\-\+tfn][^,\}\n\r]*?)\s*([,\}])', r': "\1"\2', repaired_quotes)
+    try:
+        obj, _ = decoder.raw_decode(repaired_quotes)
+        if isinstance(obj, dict): obj = [obj]
+        if isinstance(obj, list):
+            valid = validate_and_clean_segments(obj, part_num=part_num)
+            if valid:
+                return valid
+    except json.JSONDecodeError as e:
+        last_decode_err = e
+
     # ==================== STAGE 5: AUTO-CLOSE TRUNCATED BRACKETS ====================
-    open_brackets = repaired_single.count('[') - repaired_single.count(']')
-    open_braces = repaired_single.count('{') - repaired_single.count('}')
+    open_brackets = repaired_quotes.count('[') - repaired_quotes.count(']')
+    open_braces = repaired_quotes.count('{') - repaired_quotes.count('}')
     if open_brackets > 0 or open_braces > 0:
-        patch = repaired_single
+        patch = repaired_quotes
         # Trim dangling trailing comma or incomplete key
         patch = re.sub(r',\s*$', '', patch.strip())
         patch += ('}' * max(0, open_braces)) + (']' * max(0, open_brackets))
@@ -300,10 +317,10 @@ def parse_gemini_json_response(
     # Extract individual valid {...} objects if outer array is corrupted
     extracted = []
     pattern = re.compile(
-        r'\{[^{}]*?(?:"startTime"|"start"|"sourceText"|"original_text"|"translatedText"|"khmer_text"|startTime|start)[^{}]*?\}',
+        r'\{[^{}]*?(?:"startTime"|"start"|"sourceText"|"original_text"|"translatedText"|"translated_text"|"translation"|"khmer_text"|"speaker_role"|"id"|startTime|start)[^{}]*?\}',
         re.DOTALL
     )
-    for m in pattern.finditer(repaired_single):
+    for m in pattern.finditer(repaired_quotes):
         chunk_str = m.group(0)
         try:
             o = json.loads(chunk_str)
@@ -312,6 +329,8 @@ def parse_gemini_json_response(
         except Exception:
             try:
                 fixed_o = re.sub(r',\s*\}', '}', chunk_str)
+                # Apply quote repair to single object chunk
+                fixed_o = re.sub(r':\s*([^\s"\{\[\d\-\+tfn][^"\n\r]*)"\s*([,\}\n\r])', r': "\1"\2', fixed_o)
                 o = json.loads(fixed_o)
                 if isinstance(o, dict):
                     extracted.append(o)

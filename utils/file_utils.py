@@ -1,60 +1,23 @@
-import sys
 import os
 import shutil
 import json
 import tempfile
 from datetime import datetime
 from pathlib import Path
+from typing import Optional, List, Dict, Any, Tuple, Set
 from utils.logger import logger
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-
-def get_app_data_dir() -> Path:
-    """Return user-writable data directory (safe on Windows Program Files and macOS)."""
-    if getattr(sys, 'frozen', False):
-        if sys.platform == "win32":
-            appdata = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~\\AppData\\Local")
-            target = Path(appdata) / "Video AI Studio"
-        else:
-            target = Path.home() / "Library" / "Application Support" / "Video AI Studio"
-        try:
-            target.mkdir(parents=True, exist_ok=True)
-            return target
-        except Exception:
-            pass
-    return BASE_DIR
-
-DATA_DIR = get_app_data_dir()
-TEMP_DIR = DATA_DIR / "temp"
-
-def get_default_output_dir() -> Path:
-    """Return default output directory (Users/Videos on Windows or project output)."""
-    if getattr(sys, 'frozen', False):
-        if sys.platform == "win32":
-            videos_dir = Path.home() / "Videos" / "Video AI Studio"
-            try:
-                videos_dir.mkdir(parents=True, exist_ok=True)
-                return videos_dir
-            except Exception:
-                pass
-        return DATA_DIR / "output"
-    return BASE_DIR / "output"
-
-OUTPUT_DIR = get_default_output_dir()
+TEMP_DIR = BASE_DIR / "temp"
+OUTPUT_DIR = BASE_DIR / "output"
 
 def ensure_directories():
-    """Ensure temp and output directories exist safely without crashing on permission errors."""
-    try:
-        TEMP_DIR.mkdir(parents=True, exist_ok=True)
-    except Exception as e:
-        logger.warning(f"Could not create TEMP_DIR ({TEMP_DIR}): {e}")
-    try:
-        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-        (OUTPUT_DIR / "videos").mkdir(parents=True, exist_ok=True)
-        (OUTPUT_DIR / "audio").mkdir(parents=True, exist_ok=True)
-        (OUTPUT_DIR / "subtitles").mkdir(parents=True, exist_ok=True)
-    except Exception as e:
-        logger.warning(f"Could not create OUTPUT_DIR ({OUTPUT_DIR}): {e}")
+    """Ensure temp and output directories exist."""
+    TEMP_DIR.mkdir(parents=True, exist_ok=True)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    (OUTPUT_DIR / "videos").mkdir(parents=True, exist_ok=True)
+    (OUTPUT_DIR / "audio").mkdir(parents=True, exist_ok=True)
+    (OUTPUT_DIR / "subtitles").mkdir(parents=True, exist_ok=True)
 
 def get_output_subfolders(base_dir: str = None) -> list:
     """Return a list of existing subfolders inside the output directory."""
@@ -187,17 +150,122 @@ def generate_unique_filename(base_path: str, prefix: str = "khmer", subfolder: s
         
     return str(output_path)
 
-def clean_temp_directory():
-    """Clean all temporary files generated during process."""
+def run_memory_cleanup():
+    """Trigger Python garbage collection to release unreferenced memory buffers."""
+    try:
+        import gc
+        collected = gc.collect()
+        logger.debug(f"🧹 [Memory Cleanup] Collected {collected} unreferenced objects.")
+    except Exception as e:
+        logger.debug(f"Memory cleanup error: {e}")
+
+def cleanup_intermediate_dubbing_files(keep_files: Optional[List[str]] = None) -> Tuple[int, float]:
+    """
+    Safely delete intermediate audio clips, temporary merged videos, and draft subtitles after export.
+    Preserves:
+    - keep_files (e.g. final delivered exported video)
+    - Thumbnail and waveform caches (to keep UI snappy)
+    - Final user project exports in story subfolders
+    Returns: (cleaned_files_count, freed_megabytes)
+    """
+    keep_set = {os.path.abspath(f) for f in (keep_files or []) if f}
+    cleaned_count = 0
+    freed_bytes = 0
+
+    # 1. Clean intermediate audio and temp videos in TEMP_DIR
     if TEMP_DIR.exists():
         for item in TEMP_DIR.iterdir():
             try:
-                if item.is_file():
+                if not item.is_file():
+                    continue
+                abs_p = os.path.abspath(str(item))
+                if abs_p in keep_set:
+                    continue
+                name_l = item.name.lower()
+                should_remove = False
+                if name_l.endswith((".wav", ".mp3", ".aac", ".m4a")):
+                    should_remove = True
+                elif name_l.startswith(("merged_", "trans_timeline_", "fast_export_", "temp_video_", "safe_input_")) and name_l.endswith(".mp4"):
+                    should_remove = True
+                elif name_l.endswith(".txt") and "part_unknown" in name_l:
+                    should_remove = True
+
+                if should_remove:
+                    f_size = item.stat().st_size
                     item.unlink()
-                elif item.is_dir():
-                    shutil.rmtree(item)
+                    cleaned_count += 1
+                    freed_bytes += f_size
             except Exception as e:
-                print(f"Error cleaning {item}: {e}")
+                logger.debug(f"Notice skipping temp item {item.name}: {e}")
+
+    # 2. Clean intermediate draft subtitles in OUTPUT_DIR
+    for out_sub_dir in [OUTPUT_DIR, OUTPUT_DIR / "subtitles"]:
+        if out_sub_dir.exists():
+            for srt_file in out_sub_dir.iterdir():
+                try:
+                    if not srt_file.is_file():
+                        continue
+                    abs_p = os.path.abspath(str(srt_file))
+                    if abs_p in keep_set:
+                        continue
+                    s_name = srt_file.name.lower()
+                    if s_name.startswith("timeline_composite_") and s_name.endswith((".srt", ".ass", ".vtt")):
+                        f_size = srt_file.stat().st_size
+                        srt_file.unlink()
+                        cleaned_count += 1
+                        freed_bytes += f_size
+                except Exception as e:
+                    logger.debug(f"Notice skipping srt draft {srt_file.name}: {e}")
+
+    freed_mb = freed_bytes / (1024.0 * 1024.0)
+    logger.info(f"🧹 [Auto-Cleanup] Removed {cleaned_count} intermediate scratch files, freed {freed_mb:.1f} MB.")
+    return cleaned_count, freed_mb
+
+def purge_all_temp_cache(clear_thumbnails: bool = False) -> Tuple[int, float]:
+    """
+    Purge all temp scratch files, optionally including thumbnail and waveform caches.
+    Returns: (cleaned_files_count, freed_megabytes)
+    """
+    cleaned_count = 0
+    freed_bytes = 0
+    if TEMP_DIR.exists():
+        for root, dirs, files in os.walk(str(TEMP_DIR), topdown=False):
+            if not clear_thumbnails and ("thumbnails" in root or "waveforms" in root):
+                continue
+            for f in files:
+                fp = os.path.join(root, f)
+                try:
+                    sz = os.path.getsize(fp)
+                    os.remove(fp)
+                    cleaned_count += 1
+                    freed_bytes += sz
+                except Exception:
+                    pass
+            if root != str(TEMP_DIR) and not os.listdir(root):
+                try:
+                    os.rmdir(root)
+                except Exception:
+                    pass
+
+    # Clean draft srt files from output
+    for out_sub_dir in [OUTPUT_DIR, OUTPUT_DIR / "subtitles"]:
+        if out_sub_dir.exists():
+            for srt_file in out_sub_dir.glob("timeline_composite_*.srt"):
+                try:
+                    sz = srt_file.stat().st_size
+                    srt_file.unlink()
+                    cleaned_count += 1
+                    freed_bytes += sz
+                except Exception:
+                    pass
+
+    freed_mb = freed_bytes / (1024.0 * 1024.0)
+    logger.info(f"🧹 [Cache Purge] Removed {cleaned_count} files, freed {freed_mb:.1f} MB.")
+    return cleaned_count, freed_mb
+
+def clean_temp_directory():
+    """Clean all temporary files generated during process (backward compatibility wrapper)."""
+    cleanup_intermediate_dubbing_files()
 
 def save_json(data, filepath: str):
     """Save dictionary or list data to JSON file."""
@@ -735,4 +803,57 @@ def export_segments_to_srt(segments: list, filepath: str, text_key: str = "origi
         f.write(content)
     logger.info(f"📄 [SRT Export] Saved {len(segments)} segments to: {filepath}")
     return filepath
+
+
+def resolve_existing_media_path(file_path: str, context_clips: list = None) -> str:
+    """
+    Auto-heals media file path if the user moved or renamed the directory
+    (e.g., moved a drama folder from Downloads to Desktop while the app was running).
+    """
+    if file_path and os.path.exists(file_path):
+        return file_path
+    if not file_path:
+        return ""
+
+    filename = os.path.basename(file_path)
+    parent_dir = os.path.dirname(os.path.abspath(file_path))
+    parent_name = os.path.basename(parent_dir)
+
+    home = os.path.expanduser("~")
+    candidates = [
+        os.path.join(home, "Desktop", parent_name, filename),
+        os.path.join(home, "Downloads", parent_name, filename),
+        os.path.join(home, "Documents", parent_name, filename),
+        os.path.join(home, "Movies", parent_name, filename),
+        os.path.join(home, "Desktop", filename),
+        os.path.join(home, "Downloads", filename),
+        os.path.join(home, "Documents", filename),
+        os.path.join(home, "Movies", filename),
+    ]
+
+    # Check if context_clips has any clip with a valid path in a new directory
+    if context_clips:
+        for c in context_clips:
+            cp = c.get("path", "") if isinstance(c, dict) else str(c)
+            if cp and os.path.exists(cp):
+                cand = os.path.join(os.path.dirname(os.path.abspath(cp)), filename)
+                if os.path.exists(cand):
+                    candidates.insert(0, cand)
+
+    for cand in candidates:
+        if cand and os.path.exists(cand):
+            new_dir = os.path.dirname(os.path.abspath(cand))
+            logger.info(f"🔄 [Path Healer] Auto-healed moved media path: '{file_path}' -> '{cand}'")
+            # If context_clips is provided, heal all matching clips in-place
+            if context_clips and parent_dir:
+                for c in context_clips:
+                    if isinstance(c, dict):
+                        old_p = c.get("path", "")
+                        if old_p and (not os.path.exists(old_p)) and (os.path.dirname(os.path.abspath(old_p)) == parent_dir):
+                            potential_new = os.path.join(new_dir, os.path.basename(old_p))
+                            if os.path.exists(potential_new):
+                                c["path"] = potential_new
+            return cand
+
+    return file_path
 

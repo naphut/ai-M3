@@ -123,26 +123,31 @@ def build_ffmpeg_transition_command(
     # offset is the timeline timestamp where the transition begins
     # For transition between clip i and clip i+1:
     # offset_i = (cumulative duration up to cut i) - out_tl[i]
-    cum_dur = 0.0
-    prev_v = "[v0]"
-    for i in range(len(video_clips) - 1):
-        cum_dur += float(video_clips[i].get("duration", 0.0))
-        d = trans_dur[i]
-        t_type = trans_type[i]
-        next_v = f"[v{i+1}]"
-        out_v = f"[vx{i}]" if i < len(video_clips) - 2 else "[vout]"
+    has_active_xfade = any(d > 0.05 for d in trans_dur)
+    if not has_active_xfade:
+        v_inputs_str = "".join(f"[v{i}]" for i in range(len(video_clips)))
+        filter_parts.append(f"{v_inputs_str}concat=n={len(video_clips)}:v=1:a=0[vout]")
+    else:
+        cum_dur = 0.0
+        prev_v = "[v0]"
+        for i in range(len(video_clips) - 1):
+            cum_dur += float(video_clips[i].get("duration", 0.0))
+            d = trans_dur[i]
+            t_type = trans_type[i]
+            next_v = f"[v{i+1}]"
+            out_v = f"[vx{i}]" if i < len(video_clips) - 2 else "[vout]"
 
-        if d > 0.05:
-            offset = cum_dur - out_tl[i]
-            filter_parts.append(
-                f"{prev_v}{next_v}xfade=transition={t_type}:duration={d:.3f}:offset={offset:.3f}{out_v}"
-            )
-        else:
-            # Hard cut: standard concat
-            filter_parts.append(
-                f"{prev_v}{next_v}concat=n=2:v=1:a=0{out_v}"
-            )
-        prev_v = out_v
+            if d > 0.05:
+                offset = cum_dur - out_tl[i]
+                filter_parts.append(
+                    f"{prev_v}{next_v}xfade=transition={t_type}:duration={d:.3f}:offset={offset:.3f}{out_v}"
+                )
+            else:
+                offset = cum_dur
+                filter_parts.append(
+                    f"{prev_v}{next_v}xfade=transition=fade:duration=0.04:offset={offset:.3f}{out_v}"
+                )
+            prev_v = out_v
 
     # Video encoder selection (VideoToolbox on macOS, else libx264)
     vcodec = "h264_videotoolbox" if use_videotoolbox else "libx264"

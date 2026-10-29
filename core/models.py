@@ -194,6 +194,25 @@ class Segment:
         raw = f"{txt}|{voice}|{emo}|{sty}|{dur}"
         return hashlib.md5(raw.encode("utf-8")).hexdigest()[:16]
 
+    @property
+    def text(self) -> str:
+        """Backward-compatible alias for original_text."""
+        return self.original_text or ""
+
+    @text.setter
+    def text(self, value: str):
+        self.original_text = value or ""
+
+    @property
+    def khmer_text(self) -> str:
+        """Backward-compatible alias for translated_text."""
+        return self.translated_text or ""
+
+    @khmer_text.setter
+    def khmer_text(self, value: str):
+        self.translated_text = value or ""
+        self.audio_hash = self.compute_cache_hash()
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert segment to dictionary format compatible with UI tables and JSON storage."""
         d = asdict(self)

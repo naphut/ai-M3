@@ -40,6 +40,7 @@ class BatchDubbingWorker(QThread):
         background_volume: float = 0.20,
         voice_name: str = "Khmer Male - Piseth",
         target_resolution: str = "Match Source",
+        output_dir: Optional[str] = None,
         parent=None
     ):
         super().__init__(parent)
@@ -48,6 +49,8 @@ class BatchDubbingWorker(QThread):
         self.background_volume = background_volume
         self.voice_name = voice_name
         self.target_resolution = target_resolution
+        self.output_dir = str(output_dir) if output_dir else str(OUTPUT_DIR)
+        os.makedirs(self.output_dir, exist_ok=True)
         self._is_cancelled = False
 
     def cancel(self):
@@ -88,7 +91,7 @@ class BatchDubbingWorker(QThread):
                     self.item_status_changed.emit(video_path, f"{msg}", pct)
                     self.log_message.emit(f"  [{base_name}] {msg}")
 
-                out_srt_path = os.path.join(str(OUTPUT_DIR), f"{base_name}_khmer.srt")
+                out_srt_path = os.path.join(self.output_dir, f"{base_name}_khmer.srt")
                 if os.path.exists(out_srt_path) and os.path.getsize(out_srt_path) > 100:
                     self.log_message.emit(f"⚡ [{base_name}] Reusing already generated SRT ({os.path.getsize(out_srt_path):,} bytes)...")
                     with open(out_srt_path, "r", encoding="utf-8") as f:
@@ -128,8 +131,8 @@ class BatchDubbingWorker(QThread):
                     # Save Stage 1 Original Source SRT
                     try:
                         from utils.file_utils import export_segments_to_srt
-                        orig_srt_p = os.path.join(str(OUTPUT_DIR), f"{base_name}_original.srt")
-                        orig_sub_p = os.path.join(str(OUTPUT_DIR), "subtitles", f"{base_name}_original.srt")
+                        orig_srt_p = os.path.join(self.output_dir, f"{base_name}_original.srt")
+                        orig_sub_p = os.path.join(self.output_dir, "subtitles", f"{base_name}_original.srt")
                         export_segments_to_srt(stt_segments, orig_srt_p, text_key="original_text")
                         try: export_segments_to_srt(stt_segments, orig_sub_p, text_key="original_text")
                         except Exception: pass
@@ -180,17 +183,17 @@ class BatchDubbingWorker(QThread):
 
                 # Assign voices based on detected speaker tag or gender
                 for s in segments:
-                    g = (s.get("gender") or "").lower()
                     spk = str(s.get("speaker_tag") or s.get("character") or s.get("khmer_text") or "").lower()
+                    g = (s.get("gender") or s.get("role") or s.get("speaker_role") or "").lower()
                     if "ចាស់ស្រី" in spk or g == "elder_female":
                         s["voice"] = "Khmer Elder - Female (Grandmother)"
-                    elif "ចាស់ប្រុស" in spk or "ចាស់" in spk or g in ("elder", "elder_male"):
+                    elif "ចាស់ប្រុស" in spk or "[ចាស់]" in spk or g in ("elder", "elder_male"):
                         s["voice"] = "Khmer Elder - Male (Grandfather)"
-                    elif "ក្មេង" in spk or g == "child":
+                    elif "[ក្មេង]" in spk or "ក្មេង" in spk or g == "child":
                         s["voice"] = "Khmer Child - Boy (Vannak)"
-                    elif "ស្រី" in spk or g == "female":
+                    elif "[ស្រី]" in spk or "ស្រី" in spk or g == "female":
                         s["voice"] = "Khmer Female - Sreymom"
-                    elif not s.get("voice"):
+                    elif not s.get("voice") or s.get("voice") == "VoxCPM2-Khmer":
                         s["voice"] = "Khmer Male - Piseth"
 
                 tts_engine = TextToSpeech(voice_name=self.voice_name)
@@ -199,7 +202,7 @@ class BatchDubbingWorker(QThread):
                     progress_callback=lambda c, t, inf: self.item_status_changed.emit(
                         video_path, f"🎙️ TTS ({c}/{t})", int(60 + 20 * (c / float(max(1, t))))
                     ),
-                    max_workers=3,
+                    max_workers=6,
                     is_cancelled_fn=lambda: self._is_cancelled
                 )
 
@@ -221,7 +224,7 @@ class BatchDubbingWorker(QThread):
                 )
 
                 # Save copy of dubbed MP3
-                out_mp3_path = os.path.join(str(OUTPUT_DIR), f"{base_name}_khmer_dubbed.mp3")
+                out_mp3_path = os.path.join(self.output_dir, f"{base_name}_khmer_dubbed.mp3")
                 from services.voxcpm_service import export_mp3
                 export_mp3(master_khmer_wav, out_mp3_path)
 
@@ -230,8 +233,8 @@ class BatchDubbingWorker(QThread):
                 if self.background_volume > 0.0:
                     try:
                         orig_audio = get_temp_path(f"orig_audio_{base_name}.wav")
-                        from core.audio_processor import AudioProcessor
-                        AudioProcessor(video_path).extract_audio(orig_audio)
+                        from utils.ffmpeg import extract_audio
+                        extract_audio(video_path, orig_audio, sample_rate=44100)
                         if os.path.exists(orig_audio):
                             bgm_clean = get_temp_path(f"bgm_clean_{base_name}.wav")
                             create_clean_background_track(
@@ -244,6 +247,7 @@ class BatchDubbingWorker(QThread):
                                 post_pad_sec=0.12
                             )
                             music_track = bgm_clean
+                            self.log_message.emit(f"🎵 [{base_name}] Clean background track created with vocal ducking.")
                     except Exception as e_bg:
                         self.log_message.emit(f"Notice on BGM cleaning: {e_bg}")
 
@@ -251,7 +255,7 @@ class BatchDubbingWorker(QThread):
                 self.item_status_changed.emit(video_path, "⚡ 7/7 Exporting Video...", 90)
                 self.log_message.emit(f"⚡ [{base_name}] Exporting final dubbed video with Apple Silicon VideoToolbox...")
 
-                final_output_mp4 = os.path.join(str(OUTPUT_DIR), f"{base_name}_khmer_dubbed.mp4")
+                final_output_mp4 = os.path.join(self.output_dir, f"{base_name}_khmer_dubbed.mp4")
 
                 if self.effects_config and any(self.effects_config.values()):
                     export_success = video_proc.export_with_effects_and_audio(
@@ -275,6 +279,15 @@ class BatchDubbingWorker(QThread):
 
                 if export_success and os.path.exists(final_output_mp4) and os.path.getsize(final_output_mp4) > 1000:
                     success_count += 1
+                    # Clean intermediate scratch files for this batch item
+                    try:
+                        from utils.file_utils import cleanup_intermediate_dubbing_files, run_memory_cleanup
+                        c_cnt, c_mb = cleanup_intermediate_dubbing_files(keep_files=[final_output_mp4])
+                        run_memory_cleanup()
+                        if c_cnt > 0:
+                            self.log_message.emit(f"  🧹 [{base_name}] Cleaned {c_cnt} temp audio/sub files ({c_mb:.1f} MB freed).")
+                    except Exception:
+                        pass
                     self.item_status_changed.emit(video_path, "Completed ✅", 100)
                     self.item_completed.emit(video_path, final_output_mp4)
                     self.log_message.emit(f"🎉 [{base_name}] COMPLETED! Saved to: {final_output_mp4}")
@@ -288,5 +301,5 @@ class BatchDubbingWorker(QThread):
                 self.log_message.emit(f"❌ [{base_name}] Error: {e_proc}")
 
         self.overall_progress.emit(100, f"Batch Finished: {success_count}/{total_videos} videos exported.")
-        self.log_message.emit(f"\n🏁 Batch Processing Finished! {success_count}/{total_videos} videos successfully exported to: {OUTPUT_DIR}")
+        self.log_message.emit(f"\n🏁 Batch Processing Finished! {success_count}/{total_videos} videos successfully exported to: {self.output_dir}")
         self.batch_finished.emit(success_count, total_videos)

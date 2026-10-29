@@ -1,29 +1,6 @@
 import sys
 import os
 
-# Automatically add application root directory and bundled tools to system PATH
-app_dir = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, 'frozen', False) else __file__))
-search_dirs = [app_dir]
-if getattr(sys, 'frozen', False):
-    search_dirs.append(os.path.join(app_dir, "_internal"))
-    if hasattr(sys, '_MEIPASS'):
-        search_dirs.append(sys._MEIPASS)
-
-for d in search_dirs:
-    if os.path.exists(d) and d not in os.environ.get("PATH", "").split(os.pathsep):
-        os.environ["PATH"] = d + os.pathsep + os.environ.get("PATH", "")
-
-# Configure pydub to immediately find bundled ffmpeg and ffprobe
-try:
-    from pydub import AudioSegment
-    for d in search_dirs:
-        ff = os.path.join(d, "ffmpeg.exe" if sys.platform == "win32" else "ffmpeg")
-        if os.path.exists(ff):
-            AudioSegment.converter = ff
-            break
-except Exception:
-    pass
-
 # Prevent OpenBLAS / PyTorch multi-threaded stack allocation crash on macOS ARM64
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
 os.environ["OMP_NUM_THREADS"] = "1"
@@ -66,11 +43,6 @@ def main():
     app = QApplication(sys.argv)
     app.setApplicationName("Khmer Video Translator")
     app.setOrganizationName("KhmerAI")
-
-    icon_path = os.path.abspath(os.path.join(os.path.dirname(__file__), 'assets', 'app_icon.png'))
-    if os.path.exists(icon_path):
-        from qt_compat import QIcon
-        app.setWindowIcon(QIcon(icon_path))
 
     # Pre-load all Khmer fonts directly into Qt Font Database
     font_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), 'fonts'))

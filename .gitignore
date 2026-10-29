@@ -30,16 +30,7 @@ storage/generated/*
 models/*
 !models/.gitkeep
 
-# Builds, packages & executables
-dist/
-build/
-Output/
-output/
-*.exe
-*.dmg
-*.pkg
-Video AI.app/
-scratch/
+# Node.js dependencies & builds
 **/node_modules/
 **/dist/
 **/build/

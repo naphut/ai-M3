@@ -7,7 +7,7 @@ import copy
 import time
 from pathlib import Path
 from qt_compat import (
-    Qt, Slot, QThread, Signal, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
+    QtCore, Qt, Slot, QThread, Signal, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QProgressBar, QComboBox, QLineEdit, QTextEdit, QPlainTextEdit, QFileDialog, QMessageBox, QGroupBox,
     QSplitter, QFrame, QDoubleSpinBox, QSpinBox, QSlider, QInputDialog, QTabWidget, QMenu, QDialog,
     QApplication, QMimeData, QTimer, QUrl, QKeySequence, QDesktopServices, QShortcut,
@@ -27,6 +27,7 @@ from utils.file_utils import OUTPUT_DIR, get_output_path, get_temp_path
 from utils.logger import setup_logger, logger
 from utils.config_manager import get_gemini_api_key
 from core.models import PERSONA_CHOICES
+from services.voxcpm_service import VOICE_PRESETS
 
 def clean_speaker_tag(text: str) -> tuple:
     """
@@ -147,6 +148,7 @@ class GenerateVoicesWorker(QThread):
             from core.tts import TextToSpeech
             from core.dialogue_sync import DialogueSyncEngine
             from utils.file_utils import get_temp_path
+            from services.voxcpm_service import VOICE_PRESETS
             import os
 
             total = len(self.segments)
@@ -156,23 +158,30 @@ class GenerateVoicesWorker(QThread):
 
             self.progress.emit(5, f"🔊 កំពុងចាប់ផ្តើមសំយោគសំឡេង {total} ឃ្លា (Parallel Workers=3)...")
 
-            # Ensure every segment has a voice
+            # Ensure every segment has a properly synchronized voice matching character tag/role
             for seg in self.segments:
-                if not seg.get("voice"):
-                    char = str(seg.get("character") or "").lower()
-                    g = str(seg.get("gender") or "").lower()
-                    if "ចាស់ស្រី" in char or g in ("elder_female", "ចាស់ស្រី") or "grandmother" in char:
-                        seg["voice"] = "Khmer Elder - Female (Grandmother)"
-                    elif "ចាស់ប្រុស" in char or g in ("elder_male", "ចាស់ប្រុស") or "grandfather" in char:
-                        seg["voice"] = "Khmer Elder - Male (Grandfather)"
-                    elif "មនុស្សចាស់" in char or "ចាស់" in char or g in ("elder", "មនុស្សចាស់"):
-                        seg["voice"] = "Khmer Elder - Male (Grandfather)"
-                    elif "ស្រី" in char or g == "female":
-                        seg["voice"] = "Khmer Female - Sreymom"
-                    elif "ក្មេង" in char or g == "child":
-                        seg["voice"] = "Khmer Child - Boy (Vannak)"
-                    else:
-                        seg["voice"] = "Khmer Male - Piseth"
+                char = str(seg.get("character") or seg.get("speaker_tag") or seg.get("khmer_text") or "").lower()
+                g = str(seg.get("gender") or seg.get("role") or seg.get("speaker_role") or "").lower()
+                current_v = str(seg.get("voice") or seg.get("voice_id") or "")
+
+                if "ចាស់ស្រី" in char or g in ("elder_female", "ចាស់ស្រី") or "grandmother" in char:
+                    seg["voice"] = "Khmer Elder - Female (Grandmother)"
+                    seg["voice_id"] = "Khmer Elder - Female (Grandmother)"
+                elif "ចាស់ប្រុស" in char or g in ("elder_male", "ចាស់ប្រុស") or "grandfather" in char:
+                    seg["voice"] = "Khmer Elder - Male (Grandfather)"
+                    seg["voice_id"] = "Khmer Elder - Male (Grandfather)"
+                elif "មនុស្សចាស់" in char or "[ចាស់]" in char or g in ("elder", "មនុស្សចាស់"):
+                    seg["voice"] = "Khmer Elder - Male (Grandfather)"
+                    seg["voice_id"] = "Khmer Elder - Male (Grandfather)"
+                elif "[ស្រី]" in char or "ស្រី" in char or g == "female":
+                    seg["voice"] = "Khmer Female - Sreymom"
+                    seg["voice_id"] = "Khmer Female - Sreymom"
+                elif "[ក្មេង]" in char or "ក្មេង" in char or g == "child":
+                    seg["voice"] = "Khmer Child - Boy (Vannak)"
+                    seg["voice_id"] = "Khmer Child - Boy (Vannak)"
+                elif not current_v or current_v not in VOICE_PRESETS:
+                    seg["voice"] = "Khmer Male - Piseth"
+                    seg["voice_id"] = "Khmer Male - Piseth"
 
             tts_engine = TextToSpeech(voice_name=self.voice_name)
 
@@ -183,7 +192,7 @@ class GenerateVoicesWorker(QThread):
             raw_audio_paths = tts_engine.generate_all_segments(
                 self.segments,
                 progress_callback=_tts_cb,
-                max_workers=3,
+                max_workers=6,
                 is_cancelled_fn=lambda: self._is_cancelled
             )
 
@@ -315,6 +324,244 @@ class CutVideoWorker(QThread):
             self.failed_error.emit(f"កំហុសក្នុងការកាត់ត: {str(e)}")
 
 
+class GeminiPipelineWorker(QThread):
+    progress = Signal(int, str)
+    pipeline_finished = Signal(list, str)
+    error = Signal(str)
+    log = Signal(str)
+
+    def __init__(self, clips=None, fallback_video_path=None, existing_stt_segs=None, media_input_path=None, source_lang="auto", parent=None):
+        super().__init__(parent)
+        self.setStackSize(8 * 1024 * 1024)
+        self.clips = clips or []
+        self.fallback_video_path = fallback_video_path
+        self.existing_stt_segs = existing_stt_segs
+        self.media_input_path = media_input_path
+        self.last_stt_segs = existing_stt_segs
+        self.last_media_input = media_input_path
+        self.source_lang = source_lang
+        self._is_cancelled = False
+
+    def cancel(self):
+        self._is_cancelled = True
+
+    def run(self):
+        try:
+            from services.gemini_audio_service import GeminiAudioService
+            service = GeminiAudioService()
+
+            def _cb(pct, msg):
+                if self._is_cancelled:
+                    return
+                self.progress.emit(pct, msg)
+                self.log.emit(msg)
+
+            if self._is_cancelled:
+                return
+
+            media_input = self.media_input_path
+            if not media_input or not os.path.exists(media_input):
+                is_multi = len(self.clips) > 1 or (
+                    len(self.clips) == 1 and (
+                        float(self.clips[0].get("source_in", 0.0) or 0.0) > 0.05 or
+                        float(self.clips[0].get("duration", 0.0) or 0.0) > 0.0
+                    )
+                )
+
+                if is_multi:
+                    self.log.emit(f"🎬 [Timeline Audio] Building continuous timeline composite audio for {len(self.clips)} clip(s)...")
+                    self.progress.emit(8, "Building Timeline Audio...")
+                    from services.timeline_audio_service import TimelineAudioService
+                    tas = TimelineAudioService()
+                    res = tas.build_timeline_composite_audio(self.clips)
+                    media_input = res[0] if isinstance(res, (tuple, list)) else res
+
+                if not media_input or not os.path.exists(media_input):
+                    if self.clips and self.clips[0].get("path") and os.path.exists(self.clips[0]["path"]):
+                        media_input = self.clips[0]["path"]
+                    elif self.fallback_video_path and os.path.exists(self.fallback_video_path):
+                        media_input = self.fallback_video_path
+                    else:
+                        raise FileNotFoundError("រកមិនឃើញ video ឬ audio file លើ Timeline ទេ។")
+
+            self.last_media_input = media_input
+
+            if self._is_cancelled:
+                return
+
+            stem = Path(media_input).stem
+            out_khmer_srt = os.path.join(str(OUTPUT_DIR), f"{stem}_khmer.srt")
+            out_orig_srt = os.path.join(str(OUTPUT_DIR), f"{stem}_original.srt")
+            out_orig_sub = os.path.join(str(OUTPUT_DIR), "subtitles", f"{stem}_original.srt")
+            out_khmer_sub = os.path.join(str(OUTPUT_DIR), "subtitles", f"{stem}_khmer.srt")
+
+            from services.stt_service import STTService
+            from services.translation_service import (
+                TranslationService,
+                GeminiQuotaExceededError,
+                GeminiAuthError,
+                sanitize_khmer_translation
+            )
+            from utils.gemini_parser import seconds_to_srt_time
+            from utils.file_utils import export_segments_to_srt
+
+            if self.existing_stt_segs:
+                stt_segs = self.existing_stt_segs
+                self.log.emit(f"⚡ [Fast Resume] Reusing {len(stt_segs)} pre-transcribed Whisper segments. Skipping Stage 1 STT!")
+            else:
+                self.log.emit("🎙️ [Stage 1: STT] Running High-Precision Faster-Whisper (Acoustic Alignment & Full Speech Extraction)...")
+                _cb(15, "Running High-Precision Faster-Whisper STT...")
+                stt_service = STTService()
+                stt_segs = stt_service.transcribe(
+                    media_input,
+                    source_lang=self.source_lang,
+                    progress_callback=lambda p, m: _cb(15 + int(p * 0.45), f"STT: {m}")
+                )
+
+            self.last_stt_segs = stt_segs
+
+            if self._is_cancelled:
+                return
+
+            if not stt_segs:
+                self.log.emit("⚠️ Faster-Whisper returned empty, falling back to Gemini Cloud STT...")
+                service = GeminiAudioService()
+                segments, srt_content = service.process_video_pipeline(
+                    media_input, progress_callback=_cb, srt_output_path=out_khmer_srt
+                )
+            else:
+                # ===== STAGE 1: STT COMPLETED =====
+                self.log.emit(f"🎙️ [Stage 1 Complete] STT extracted {len(stt_segs)} dialogue segments.")
+                try:
+                    if os.path.exists(out_orig_srt): os.remove(out_orig_srt)
+                    if os.path.exists(out_orig_sub): os.remove(out_orig_sub)
+                except Exception:
+                    pass
+
+                if self._is_cancelled:
+                    return
+
+                # ===== STAGE 2: TRANSLATE TO KHMER =====
+                _cb(65, f"Translating {len(stt_segs)} segments to Khmer with Gemini AI...")
+                self.log.emit(f"🌐 [Stage 2: Translation] Translating {len(stt_segs)} segments to natural spoken Khmer with Gemini AI...")
+                trans_service = TranslationService()
+                translated_segs = trans_service.translate_segments(
+                    stt_segs,
+                    source_lang=self.source_lang,
+                    target_lang="km",
+                    progress_callback=lambda p, m: _cb(65 + int(p * 0.30), f"Translating: {m}")
+                )
+
+                if self._is_cancelled:
+                    return
+
+                ui_segments = []
+                srt_lines = []
+                from services.speaker_detector import SpeakerDetector
+                detector = SpeakerDetector(audio_wav_path=media_input)
+
+                raw_for_diarization = []
+                for s in translated_segs:
+                    raw_for_diarization.append({
+                        "start": round(float(s.start), 2),
+                        "end": round(float(s.end), 2),
+                        "original_text": s.original_text or "",
+                        "khmer_text": s.translated_text or (s.original_text or ""),
+                        "speaker": getattr(s, 'speaker_id', None) or "Speaker 1",
+                        "speaker_tag": getattr(s, 'speaker_tag', None),
+                        "speaker_role": getattr(s, 'speaker_role', None),
+                        "voice": getattr(s, 'voice_id', None)
+                    })
+                diarized_results = detector.diarize_and_profile_segments(raw_for_diarization)
+
+                for i, s in enumerate(translated_segs, 1):
+                    st_val = round(float(s.start), 2)
+                    et_val = round(float(s.end), 2)
+                    orig_t = s.original_text or ""
+                    d = diarized_results[i - 1] if i - 1 < len(diarized_results) else {}
+
+                    tag = d.get("speaker_tag") or getattr(s, 'speaker_tag', None) or "[ប្រុស]"
+                    voc = d.get("voice") or getattr(s, 'voice_id', None) or "Khmer Male - Piseth"
+                    pers = d.get("persona") or getattr(s, 'persona', None) or "Male Adult"
+                    role = (d.get("role") or getattr(s, 'speaker_role', None) or "male").lower()
+
+                    if "[ស្រី]" in tag or role == "female":
+                        tag = "[ស្រី]"
+                        voc = "Khmer Female - Sreymom"
+                        pers = "Female Adult"
+                    elif "[ក្មេង]" in tag or role == "child":
+                        tag = "[ក្មេង]"
+                        is_girl = any(w in (s.translated_text or "").lower() for w in ["ក្មេងស្រី", "កូនស្រី", "ស្រី", "girl"])
+                        voc = "Khmer Child - Girl (Sreyka)" if is_girl else "Khmer Child - Boy (Vannak)"
+                        pers = "Girl / Child" if is_girl else "Boy / Child"
+                    elif "[ចាស់ស្រី]" in tag or role == "elder_female":
+                        tag = "[ចាស់ស្រី]"
+                        voc = "Khmer Elder - Female (Grandmother)"
+                        pers = "Elderly Female"
+                    elif "[ចាស់ប្រុស]" in tag or "[ចាស់]" in tag or role == "elder_male":
+                        tag = "[ចាស់ប្រុស]"
+                        voc = "Khmer Elder - Male (Grandfather)"
+                        pers = "Elderly Male"
+                    else:
+                        tag = "[ប្រុស]"
+                        voc = "Khmer Male - Piseth"
+                        pers = "Male Adult"
+
+                    clean_khm_untagged = sanitize_khmer_translation(s.translated_text or "")
+                    if not clean_khm_untagged:
+                        clean_khm_untagged = sanitize_khmer_translation(orig_t or "")
+
+                    tag_match = re.match(r"^\[(ប្រុស|ស្រី|ក្មេង|ក្មេងប្រុស|ក្មេងស្រី|ចាស់|ចាស់ប្រុស|ចាស់ស្រី)\]\s*", clean_khm_untagged)
+                    if tag_match:
+                        clean_khm_untagged = clean_khm_untagged[len(tag_match.group(0)):].strip()
+
+                    if not re.search(r'[\u1780-\u17FF]', clean_khm_untagged):
+                        clean_khm_untagged = "..."
+
+                    final_tagged_khm = f"{tag} {clean_khm_untagged}".strip()
+                    spk_t = getattr(s, 'speaker_id', None) or d.get("speaker") or f"Speaker 1"
+
+                    ui_segments.append({
+                        "id": f"sub_{i:04d}",
+                        "start": st_val,
+                        "end": et_val,
+                        "original_text": orig_t,
+                        "khmer_text": final_tagged_khm,
+                        "translated_text": final_tagged_khm,
+                        "speaker": spk_t,
+                        "speaker_tag": tag,
+                        "persona": pers,
+                        "character": pers,
+                        "voice": voc,
+                        "voice_id": voc,
+                        "style": "Normal"
+                    })
+
+                    st_srt = seconds_to_srt_time(st_val)
+                    et_srt = seconds_to_srt_time(et_val)
+                    srt_lines.append(f"{i}\n{st_srt} --> {et_srt}\n{final_tagged_khm}\n")
+
+                srt_content = "\n".join(srt_lines)
+                if out_khmer_srt:
+                    with open(out_khmer_srt, "w", encoding="utf-8") as f:
+                        f.write(srt_content)
+                    try:
+                        with open(out_khmer_sub, "w", encoding="utf-8") as f:
+                            f.write(srt_content)
+                    except Exception:
+                        pass
+                    self.log.emit(f"📄 [Stage 2 Complete] Khmer SRT saved: {out_khmer_srt}")
+                segments = ui_segments
+
+            if self._is_cancelled:
+                return
+
+            self.pipeline_finished.emit(segments, srt_content)
+        except Exception as e:
+            if not self._is_cancelled:
+                self.error.emit(str(e))
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -323,6 +570,7 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(1080, 750)
         
         self.worker = None
+        self._gemini_worker = None
         self.transcribe_worker = None
         self.translate_worker = None
         self.react_worker = None
@@ -333,6 +581,7 @@ class MainWindow(QMainWindow):
         self.mp3_worker = None
         self.current_project_file = None
         self.voice_worker = None
+        self.visual_prerender_worker = None
         self.merge_worker = None
         self.merge_progress_dialog = None
         self.cut_worker = None
@@ -385,10 +634,22 @@ class MainWindow(QMainWindow):
         self.redo_y_shortcut.activated.connect(lambda: self._trigger_shortcut_redo())
 
         # CapCut Delete Shortcut (Delete / Backspace)
-        self.del_shortcut = QShortcut(QKeySequence.Delete, self)
+        self.del_shortcut = QShortcut(QKeySequence(Qt.Key_Delete), self)
         self.del_shortcut.activated.connect(lambda: self._trigger_shortcut_delete())
         self.backspace_shortcut = QShortcut(QKeySequence(Qt.Key_Backspace), self)
         self.backspace_shortcut.activated.connect(lambda: self._trigger_shortcut_delete())
+
+        # CapCut Spacebar Play/Pause & Home Rewind Shortcuts
+        self.play_shortcut = QShortcut(QKeySequence(Qt.Key_Space), self)
+        self.play_shortcut.activated.connect(self._trigger_shortcut_play_toggle)
+        self.home_shortcut = QShortcut(QKeySequence(Qt.Key_Home), self)
+        self.home_shortcut.activated.connect(self._trigger_shortcut_rewind_start)
+
+        # Background Continuous Auto-Save Timer (every 60s for continuous disaster recovery)
+        self.autosave_timer = QTimer(self)
+        self.autosave_timer.setInterval(60 * 1000)
+        self.autosave_timer.timeout.connect(self._auto_save_project)
+        self.autosave_timer.start()
 
     def _load_stylesheet(self):
         qss_path = Path(__file__).resolve().parent / "styles.qss"
@@ -482,6 +743,12 @@ class MainWindow(QMainWindow):
         self.gemini_key_btn.clicked.connect(self._open_gemini_settings)
         th_lay.addWidget(self.gemini_key_btn)
         self._update_gemini_btn_status()
+
+        self.clean_cache_btn = QPushButton("🧹 Clear Cache", self)
+        self.clean_cache_btn.setProperty("class", "btn-gray")
+        self.clean_cache_btn.setToolTip("សម្អាតឯកសារ Audio និង Subtitles បណ្តោះអាសន្នទាំងអស់ដើម្បីដោះលែងទំហំ Disk Space")
+        self.clean_cache_btn.clicked.connect(self._clear_temp_cache)
+        th_lay.addWidget(self.clean_cache_btn)
 
         self.save_proj_btn = QPushButton("Save", self)
         self.save_proj_btn.setProperty("class", "btn-gray")
@@ -695,6 +962,7 @@ class MainWindow(QMainWindow):
         self.video_preview.mark_in_requested.connect(lambda sec: self.timeline_editor.waveform_canvas.set_in_point(sec))
         self.video_preview.mark_out_requested.connect(lambda sec: self.timeline_editor.waveform_canvas.set_out_point(sec))
         self.video_preview.cut_requested.connect(lambda sec: self._on_video_cut_requested())
+        self.video_preview.subtitle_edited_on_screen.connect(self._on_subtitle_edited_from_screen)
         
         # Connect Subtitle Table signals
         self.subtitle_table.seek_requested.connect(self.video_preview.seek_to_time_sec)
@@ -702,6 +970,8 @@ class MainWindow(QMainWindow):
         self.subtitle_table.cancel_voices_requested.connect(self._cancel_voice_generation)
         self.subtitle_table.subtitle_style_changed.connect(self._on_table_subtitle_style_changed)
         self.subtitle_table.gemini_ai_requested.connect(self._run_gemini_audio_pipeline)
+        self.subtitle_table.detect_speech_requested.connect(lambda: self._start_transcription_worker(auto_translate_next=False))
+        self.subtitle_table.translate_table_requested.connect(self._run_translation)
         self.subtitle_table.paste_srt_requested.connect(self._on_paste_sub_button_clicked)
         self.subtitle_table.export_srt_requested.connect(self._export_khmer_srt)
         self.subtitle_table.export_khmer_srt_requested.connect(self._export_khmer_srt)
@@ -818,7 +1088,7 @@ class MainWindow(QMainWindow):
             "720p (HD)",
             "480p (SD)"
         ])
-        self.export_res_combo.setCurrentText("1080p (Full HD) ⭐")
+        self.export_res_combo.setCurrentText("Original (ដើម)")
         self.export_res_combo.hide()
 
         self.export_mp3_btn = QPushButton("Export MP3")
@@ -944,6 +1214,24 @@ class MainWindow(QMainWindow):
         for btn in buttons_to_toggle:
             if btn is not None:
                 btn.setEnabled(not is_running)
+
+        if hasattr(self, 'magic_auto_dub_btn') and self.magic_auto_dub_btn:
+            self.magic_auto_dub_btn.setEnabled(not is_running)
+
+        if hasattr(self, 'media_bin') and hasattr(self.media_bin, 'batch_btn') and self.media_bin.batch_btn:
+            self.media_bin.batch_btn.setEnabled(not is_running)
+
+        if hasattr(self, 'subtitle_table') and hasattr(self.subtitle_table, 'gemini_ai_btn') and self.subtitle_table.gemini_ai_btn:
+            self.subtitle_table.gemini_ai_btn.setEnabled(not is_running)
+
+        if hasattr(self, 'video_preview') and self.video_preview:
+            try:
+                if is_running:
+                    self.video_preview.pause()
+                if hasattr(self.video_preview, 'play_btn'):
+                    self.video_preview.play_btn.setEnabled(not is_running)
+            except Exception:
+                pass
 
         if hasattr(self, 'cancel_export_btn'):
             self.cancel_export_btn.setVisible(is_running)
@@ -2316,7 +2604,7 @@ class MainWindow(QMainWindow):
         self._start_transcription_worker(auto_translate_next=True)
 
     # ==================== 5-STEP GEMINI MULTIMODAL AUDIO PIPELINE ====================
-    def _run_gemini_audio_pipeline(self, auto_export_on_finish: bool = False):
+    def _run_gemini_audio_pipeline(self, auto_export_on_finish: bool = False, existing_stt_segs: list = None, media_input_path: str = None):
         """Execute the complete 5-step Gemini Multimodal Audio pipeline natively on Desktop across all Timeline clips."""
         clips = self._get_current_timeline_clips()
         if not self.video_path and not clips:
@@ -2327,173 +2615,33 @@ class MainWindow(QMainWindow):
             return
 
         clip_count = len(clips)
-        self.log_console.append_log(f"🚀 [Gemini 5-Step Pipeline] Starting audio processing for {clip_count} Timeline clip(s)...")
-        self._set_processing_state(True, f"🧠 [1/5] Gemini AI Audio Pipeline running ({clip_count} clips)...")
-        self.progress_bar.setValue(5)
+        if existing_stt_segs:
+            self.log_console.append_log(f"⚡ [Fast Resume] Reusing {len(existing_stt_segs)} pre-transcribed Whisper segments. Resuming Stage 2 translation...")
+            self._set_processing_state(True, f"🌐 Resuming translation with Gemini AI ({len(existing_stt_segs)} dialogues)...")
+            self.progress_bar.setValue(65)
+        else:
+            self.log_console.append_log(f"🚀 [Gemini 5-Step Pipeline] Starting audio processing for {clip_count} Timeline clip(s)...")
+            self._set_processing_state(True, f"🧠 [1/5] Gemini AI Audio Pipeline running ({clip_count} clips)...")
+            self.progress_bar.setValue(5)
 
         from services.gemini_audio_service import GeminiAudioService
 
-        class GeminiPipelineWorker(QThread):
-            progress = Signal(int, str)
-            finished = Signal(list, str)
-            error = Signal(str)
-            log = Signal(str)
+        if hasattr(self, '_gemini_worker') and self._gemini_worker and self._gemini_worker.isRunning():
+            try:
+                self._gemini_worker.cancel()
+                self._gemini_worker.wait(300)
+            except Exception:
+                pass
 
-            def __init__(self, clips=None, fallback_video_path=None):
-                super().__init__()
-                self.clips = clips or []
-                self.fallback_video_path = fallback_video_path
-
-            def run(self):
-                try:
-                    service = GeminiAudioService()
-                    def _cb(pct, msg):
-                        self.progress.emit(pct, msg)
-                        self.log.emit(msg)
-
-                    media_input = None
-                    is_multi = len(self.clips) > 1 or (
-                        len(self.clips) == 1 and (
-                            float(self.clips[0].get("source_in", 0.0) or 0.0) > 0.05 or
-                            float(self.clips[0].get("duration", 0.0) or 0.0) > 0.0
-                        )
-                    )
-
-                    if is_multi:
-                        self.log.emit(f"🎬 [Timeline Audio] Building continuous timeline composite audio for {len(self.clips)} clip(s)...")
-                        self.progress.emit(8, "Building Timeline Audio...")
-                        from services.timeline_audio_service import TimelineAudioService
-                        tas = TimelineAudioService()
-                        res = tas.build_timeline_composite_audio(self.clips)
-                        media_input = res[0] if isinstance(res, (tuple, list)) else res
-
-                    if not media_input or not os.path.exists(media_input):
-                        if self.clips and self.clips[0].get("path") and os.path.exists(self.clips[0]["path"]):
-                            media_input = self.clips[0]["path"]
-                        elif self.fallback_video_path and os.path.exists(self.fallback_video_path):
-                            media_input = self.fallback_video_path
-                        else:
-                            raise FileNotFoundError("រកមិនឃើញ video ឬ audio file លើ Timeline ទេ។")
-
-                    stem = Path(media_input).stem
-                    out_khmer_srt = os.path.join(str(OUTPUT_DIR), f"{stem}_khmer.srt")
-                    out_orig_srt = os.path.join(str(OUTPUT_DIR), f"{stem}_original.srt")
-                    out_orig_sub = os.path.join(str(OUTPUT_DIR), "subtitles", f"{stem}_original.srt")
-                    out_khmer_sub = os.path.join(str(OUTPUT_DIR), "subtitles", f"{stem}_khmer.srt")
-
-                    self.log.emit("🎙️ [Stage 1: STT] Running High-Precision Faster-Whisper (Acoustic Alignment & Full Speech Extraction)...")
-                    _cb(15, "Running High-Precision Faster-Whisper STT...")
-                    from services.stt_service import STTService
-                    from services.translation_service import TranslationService
-                    from utils.gemini_parser import seconds_to_srt_time
-                    from utils.file_utils import export_segments_to_srt
-
-                    stt_service = STTService()
-                    stt_segs = stt_service.transcribe(
-                        media_input,
-                        source_lang="auto",
-                        progress_callback=lambda p, m: _cb(15 + int(p * 0.45), f"STT: {m}")
-                    )
-
-                    if not stt_segs:
-                        self.log.emit("⚠️ Faster-Whisper returned empty, falling back to Gemini Cloud STT...")
-                        service = GeminiAudioService()
-                        segments, srt_content = service.process_video_pipeline(
-                            media_input, progress_callback=_cb, srt_output_path=out_khmer_srt
-                        )
-                    else:
-                        # ===== STAGE 1: SAVE ORIGINAL SOURCE SRT (CHINESE) =====
-                        export_segments_to_srt(stt_segs, out_orig_srt, text_key="original_text")
-                        try:
-                            export_segments_to_srt(stt_segs, out_orig_sub, text_key="original_text")
-                        except Exception:
-                            pass
-                        self.log.emit(f"📄 [Stage 1 Complete] Original Source SRT saved ({len(stt_segs)} segments): {out_orig_srt}")
-
-                        # ===== STAGE 2: TRANSLATE TO KHMER =====
-                        _cb(65, f"Translating {len(stt_segs)} segments to Khmer with Gemini AI...")
-                        self.log.emit(f"🌐 [Stage 2: Translation] Translating {len(stt_segs)} segments to natural spoken Khmer with Gemini AI...")
-                        trans_service = TranslationService()
-                        translated_segs = trans_service.translate_segments(
-                            stt_segs,
-                            source_lang="auto",
-                            target_lang="km",
-                            progress_callback=lambda p, m: _cb(65 + int(p * 0.30), f"Translating: {m}")
-                        )
-
-                        ui_segments = []
-                        srt_lines = []
-                        from services.speaker_detector import SpeakerDetector
-                        detector = SpeakerDetector(audio_wav_path=media_input)
-
-                        raw_for_diarization = []
-                        for s in translated_segs:
-                            raw_for_diarization.append({
-                                "start": round(float(s.start), 2),
-                                "end": round(float(s.end), 2),
-                                "original_text": s.original_text or "",
-                                "khmer_text": s.translated_text or (s.original_text or ""),
-                                "speaker": getattr(s, 'speaker_id', None) or "Speaker 1"
-                            })
-                        diarized_results = detector.diarize_and_profile_segments(raw_for_diarization)
-
-                        for i, s in enumerate(translated_segs, 1):
-                            st_val = round(float(s.start), 2)
-                            et_val = round(float(s.end), 2)
-                            orig_t = s.original_text or ""
-                            d = diarized_results[i - 1] if i - 1 < len(diarized_results) else {}
-
-                            tag = d.get("speaker_tag", "[ប្រុស]")
-                            voc = d.get("voice", "Khmer Male - Piseth")
-                            role = d.get("role", "male")
-                            pers = d.get("persona", "Male Adult")
-                            clean_khm_untagged = d.get("khmer_text", "")
-                            if not clean_khm_untagged:
-                                clean_khm_untagged = (s.translated_text or orig_t).strip()
-                                tag_match = re.match(r"^\[(ប្រុស|ស្រី|ក្មេង|ក្មេងប្រុស|ក្មេងស្រី|ចាស់|ចាស់ប្រុស|ចាស់ស្រី)\]\s*", clean_khm_untagged)
-                                if tag_match:
-                                    clean_khm_untagged = clean_khm_untagged[len(tag_match.group(0)):].strip()
-
-                            final_tagged_khm = f"{tag} {clean_khm_untagged}".strip()
-                            spk_t = d.get("speaker") or getattr(s, 'speaker_id', None) or f"Speaker 1"
-
-                            ui_segments.append({
-                                "id": f"sub_{i:04d}",
-                                "start": st_val,
-                                "end": et_val,
-                                "original_text": orig_t,
-                                "khmer_text": final_tagged_khm,
-                                "translated_text": final_tagged_khm,
-                                "speaker": spk_t,
-                                "speaker_tag": tag,
-                                "persona": pers,
-                                "character": pers,
-                                "voice": voc,
-                                "voice_id": voc,
-                                "style": "Normal"
-                            })
-
-                            st_srt = seconds_to_srt_time(st_val)
-                            et_srt = seconds_to_srt_time(et_val)
-                            srt_lines.append(f"{i}\n{st_srt} --> {et_srt}\n{final_tagged_khm}\n")
-
-                        srt_content = "\n".join(srt_lines)
-                        if out_khmer_srt:
-                            with open(out_khmer_srt, "w", encoding="utf-8") as f:
-                                f.write(srt_content)
-                            try:
-                                with open(out_khmer_sub, "w", encoding="utf-8") as f:
-                                    f.write(srt_content)
-                            except Exception:
-                                pass
-                            self.log.emit(f"📄 [Stage 2 Complete] Khmer SRT saved: {out_khmer_srt}")
-                        segments = ui_segments
-
-                    self.finished.emit(segments, srt_content)
-                except Exception as e:
-                    self.error.emit(str(e))
-
-        self._gemini_worker = GeminiPipelineWorker(clips=clips, fallback_video_path=self.video_path)
+        src_lang = self._get_selected_source_language()
+        self._gemini_worker = GeminiPipelineWorker(
+            clips=clips,
+            fallback_video_path=self.video_path,
+            existing_stt_segs=existing_stt_segs,
+            media_input_path=media_input_path,
+            source_lang=src_lang,
+            parent=self
+        )
         self._gemini_worker.progress.connect(lambda p, m: (self.progress_bar.setValue(p), self.status_lbl.setText(m)))
         self._gemini_worker.log.connect(self.log_console.append_log)
 
@@ -2509,30 +2657,75 @@ class MainWindow(QMainWindow):
                 self.video_preview._update_display()
             self.log_console.append_log(f"🎉 [Gemini AI] Successfully imported {len(segments)} Khmer segments into Subtitle Editor!")
 
-            if auto_export_on_finish:
+            if getattr(self, '_auto_dub_review_mode', False):
+                self.log_console.append_log("✨ [1-Click Auto Dub] Subtitles ready! Automatically synthesizing Khmer voices & lip-syncing...")
+                self.status_lbl.setText("✨ [1-Click Auto Dub] កំពុងសំយោគសំឡេងខ្មែរ (TTS Voices)...")
+                QTimer.singleShot(300, self._generate_all_voices)
+            elif auto_export_on_finish:
                 self.log_console.append_log("✨ [1-Click Auto Dub] Subtitles ready! Automatically synthesizing voices and exporting final video...")
                 self.status_lbl.setText("✨ [1-Click Auto Dub] កំពុងបញ្ចូលសំឡេងខ្មែរ និង Export វីដេអូចុងក្រោយ...")
-                QtCore.QTimer.singleShot(600, self._export_final_video)
+                QTimer.singleShot(600, self._export_final_video)
             else:
-                QMessageBox.information(
-                    self, "Gemini Subtitles Ready",
-                    f"ការបកប្រែ និងចាប់ម៉ោងតាម Gemini AI បានជោគជ័យ!\n\n"
-                    f"ចំនួនប្រយោគ: {len(segments)} បន្ទាត់\n"
-                    f"អ្នកអាចកែសម្រួលអក្សរ ឬចុច 'EXPORT FINAL VIDEO' ដើម្បីបញ្ចូលសំឡេងខ្មែរបានភ្លាមៗ។"
-                )
+                def _show_success():
+                    QMessageBox.information(
+                        self, "Gemini Subtitles Ready",
+                        f"ការបកប្រែ និងចាប់ម៉ោងតាម Gemini AI បានជោគជ័យ!\n\n"
+                        f"ចំនួនប្រយោគ: {len(segments)} បន្ទាត់\n"
+                        f"អ្នកអាចកែសម្រួលអក្សរ ឬចុច 'Generate Voices' ដើម្បីបញ្ចូលសំឡេងខ្មែរបានភ្លាមៗ។"
+                    )
+                QTimer.singleShot(150, _show_success)
 
         def on_err(err):
             self._set_processing_state(False, "❌ Gemini Pipeline Error")
             self.log_console.append_log(f"❌ [Gemini AI Error]: {err}")
-            QMessageBox.critical(self, "Gemini Error", f"កំហុសក្នុងការដំណើរការ Gemini AI:\n{err}")
+            
+            cached_segs = getattr(self._gemini_worker, 'last_stt_segs', None)
+            cached_media = getattr(self._gemini_worker, 'last_media_input', None)
 
-        self._gemini_worker.finished.connect(on_done)
+            is_quota_err = any(k in str(err) for k in ["429", "RESOURCE_EXHAUSTED", "Quota", "quota", "API_KEY_INVALID", "403"])
+            if is_quota_err and cached_segs:
+                from qt_compat import QInputDialog, QLineEdit
+                new_key, ok = QInputDialog.getText(
+                    self,
+                    "Gemini API Key Quota Reached",
+                    f"⚠️ Gemini API Key របស់អ្នកបានដល់កម្រិតកំណត់ (Error 429: Quota Exhausted)។\n\n"
+                    f"✅ សំឡេងដើម Whisper ({len(cached_segs)} ប្រយោគ) ត្រូវបានរក្សាទុករួចរាល់ហើយ មិនចាំបាច់ចាប់សំឡេងឡើងវិញទេ!\n\n"
+                    f"សូមបញ្ចូល Gemini API Key ថ្មី (AIzaSy...) ដើម្បីបន្តការបកប្រែភ្លាមៗ៖",
+                    QLineEdit.Normal,
+                    ""
+                )
+                if ok and new_key and new_key.strip():
+                    k_clean = new_key.strip()
+                    from utils.config_manager import save_gemini_api_keys
+                    save_gemini_api_keys([k_clean])
+                    os.environ["GEMINI_API_KEY"] = k_clean
+                    self.log_console.append_log(f"🔑 [API Key Updated] Gemini key saved: {k_clean[:8]}... Resuming translation now!")
+                    QTimer.singleShot(200, lambda: self._run_gemini_audio_pipeline(
+                        auto_export_on_finish=auto_export_on_finish,
+                        existing_stt_segs=cached_segs,
+                        media_input_path=cached_media
+                    ))
+                    return
+
+            def _show_err():
+                QMessageBox.critical(self, "Gemini Error", f"កំហុសក្នុងការដំណើរការ Gemini AI:\n{err}")
+            QTimer.singleShot(150, _show_err)
+
+        self._gemini_worker.pipeline_finished.connect(on_done)
         self._gemini_worker.error.connect(on_err)
         self._gemini_worker.start()
 
     # ==================== 1-CLICK MAGIC AUTO DUB & SUBTITLE PRESETS ====================
     def _on_magic_1click_dub_clicked(self):
-        """1-Click Magic Auto Dub: End-to-end hands-free pipeline from Video to Dubbed & Subtitled Output."""
+        """1-Click Magic Auto Dub: End-to-end hands-free pipeline with Destination Folder selection and Effects Review."""
+        if hasattr(self, '_batch_worker') and self._batch_worker and self._batch_worker.isRunning():
+            QMessageBox.warning(
+                self, "Batch Dubbing Active ⚡",
+                "⚠️ កំពុងដំណើរការ Batch Dubbing លើ Media Bin!\n\n"
+                "ដើម្បីការពារកុំឱ្យជាន់ដំណើរការ និងកុំឱ្យឡើងកម្តៅម៉ាស៊ីន សូមរង់ចាំឱ្យ Batch បញ្ចប់សិន ឬចុច '⏹ Stop Batch' ក្នុង Media Bin ជាមុនសិន។"
+            )
+            return
+
         cur_v = getattr(self, 'video_path', None)
         if not cur_v or not os.path.exists(cur_v):
             self._browse_video()
@@ -2543,35 +2736,37 @@ class MainWindow(QMainWindow):
         if not self._ensure_gemini_key_available():
             return
 
-        mb_items = getattr(self.media_bin, 'items', []) if hasattr(self, 'media_bin') else []
-        if len(mb_items) > 1:
-            reply = QMessageBox.question(
-                self, "✨ 1-Click Auto Dub",
-                f"រកឃើញវីដេអូចំនួន {len(mb_items)} Clips ក្នុង Media Bin!\n\n"
-                f"• ចុច 'Yes' ដើម្បីដំណើរការ Auto Dub វីដេអូទាំងអស់តែម្តង (Batch Mode)\n"
-                f"• ចុច 'No' ដើម្បីដំណើរការតែវីដេអូសកម្មនេះប៉ុណ្ណោះ",
-                QMessageBox.Yes | QMessageBox.No
-            )
-            if reply == QMessageBox.Yes:
-                self._start_batch_dubbing([item["path"] for item in mb_items])
-                return
 
-        curr_segs = getattr(self, 'transcribed_segments', [])
-        if curr_segs:
-            reply = QMessageBox.question(
-                self, "✨ 1-Click Auto Dub",
-                f"វីដេអូនេះមាន Subtitle ចំនួន {len(curr_segs)} បន្ទាត់រួចរាល់ហើយ!\n\n"
-                f"• ចុច 'Yes' ដើម្បី Export វីដេអូជាមួយសំឡេងខ្មែរភ្លាមៗ (Export Final Video)\n"
-                f"• ចុច 'No' ដើម្បីដំណើរការស្កេន AI ឡើងវិញពីដើម",
-                QMessageBox.Yes | QMessageBox.No
-            )
-            if reply == QMessageBox.Yes:
-                self._export_final_video()
-                return
+        from gui.widgets import AutoDubSetupDialog
+        curr_out_dir = str(self.output_dir) if hasattr(self, 'output_dir') else os.path.abspath("output")
+        dlg = AutoDubSetupDialog(parent=self, output_dir=curr_out_dir, video_path=cur_v)
+        if dlg.exec() != QDialog.Accepted:
+            return
 
-        self.status_lbl.setText("✨ [1-Click Auto Dub] កំពុងដំណើរការ Faster-Whisper STT → Gemini Text Translation...")
-        self.log_console.append_log("✨ [1-Click Auto Dub] Starting Production Pipeline (Faster-Whisper STT → Gemini Text Translation)...")
-        self._start_dubbing_worker(pre_edited_segments=None)
+        settings = dlg.get_settings()
+        chosen_dir = settings.get("output_dir", curr_out_dir)
+        review_effects_first = settings.get("review_effects_first", True)
+        chosen_res = settings.get("resolution", "Match Source (Original)")
+
+        if chosen_dir and os.path.exists(str(chosen_dir)):
+            self.output_dir = str(chosen_dir)
+
+        if hasattr(self, 'res_combo'):
+            for idx in range(self.res_combo.count()):
+                if chosen_res.split()[0].lower() in self.res_combo.itemText(idx).lower():
+                    self.res_combo.setCurrentIndex(idx)
+                    break
+
+        if review_effects_first:
+            self._auto_dub_review_mode = True
+            self.status_lbl.setText("🚀 [1-Click Auto Dub] Running Speech Detection & Gemini Translation...")
+            self.log_console.append_log(f"🚀 [1-Click Auto Dub] Running End-to-End AI Dubbing for {os.path.basename(cur_v)} (Output target: {self.output_dir})...")
+            self._run_gemini_audio_pipeline(auto_export_on_finish=False)
+        else:
+            self._auto_dub_review_mode = False
+            self.status_lbl.setText("🚀 [1-Click Auto Dub] Running Auto Dub & Direct Export...")
+            self.log_console.append_log(f"🚀 [1-Click Auto Dub] Running Auto Dub & Direct Export to: {self.output_dir}...")
+            self._run_gemini_audio_pipeline(auto_export_on_finish=True)
 
     def _show_quick_sub_styles_menu(self):
         """Display quick popup menu with popular TikTok, Cinema, and Viral subtitle presets."""
@@ -2633,8 +2828,31 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "No Videos", "គ្មានវីដេអូសម្រាប់ដំណើរការ Batch ទេ។")
             return
 
+        # CapCut Mutual Concurrency Guard: Ensure Studio Pipeline is not currently executing
+        if (hasattr(self, '_gemini_worker') and self._gemini_worker and self._gemini_worker.isRunning()) or \
+           (hasattr(self, '_voice_worker') and self._voice_worker and self._voice_worker.isRunning()) or \
+           (hasattr(self, '_transcription_worker') and self._transcription_worker and self._transcription_worker.isRunning()) or \
+           (hasattr(self, '_export_worker') and self._export_worker and self._export_worker.isRunning()):
+            QMessageBox.warning(
+                self, "Studio Pipeline Active 🎬",
+                "⚠️ កំពុងដំណើរការ AI Dubbing លើ Studio Timeline!\n\n"
+                "ដើម្បីការពារកុំឱ្យជាន់ដំណើរការ និងកុំឱ្យឡើងកម្តៅម៉ាស៊ីន សូមរង់ចាំឱ្យចប់សិន ទើបចាប់ផ្តើម Batch Dubbing លើ Media Bin។"
+            )
+            return
+
         if not self._ensure_gemini_key_available():
             return
+
+        # CapCut-Style Output Destination Selector: Let user choose where to save all episodes
+        curr_out = str(getattr(self, 'output_dir', OUTPUT_DIR))
+        chosen_dir = QFileDialog.getExistingDirectory(
+            self,
+            f"ជ្រើសរើស Folder សម្រាប់ Save វីដេអូសម្រេចទាំងអស់ ({len(video_paths)} ភាគ)",
+            curr_out
+        )
+        if not chosen_dir:
+            return  # User cancelled selection
+        self.output_dir = str(chosen_dir)
 
         from core.batch_worker import BatchDubbingWorker
 
@@ -2644,31 +2862,78 @@ class MainWindow(QMainWindow):
         target_res = self.res_combo.currentText() if hasattr(self, 'res_combo') else "Match Source"
 
         self.media_bin.set_batch_running(True)
-        self.log_console.append_log(f"⚡ [Batch Dubbing] Launching batch queue for {len(video_paths)} videos...")
+        if hasattr(self, 'magic_auto_dub_btn') and self.magic_auto_dub_btn:
+            self.magic_auto_dub_btn.setEnabled(False)
+            self.magic_auto_dub_btn.setToolTip("⚠️ កំពុងដំណើរការ Batch Dubbing លើ Media Bin...")
+
+        self.log_console.append_log(f"⚡ [Batch Dubbing] Launching batch queue for {len(video_paths)} videos (Target: {self.output_dir})...")
 
         self._batch_worker = BatchDubbingWorker(
             video_paths=video_paths,
             effects_config=effects_config,
             background_volume=bgm_vol,
             voice_name=voice_name,
-            target_resolution=target_res
+            target_resolution=target_res,
+            output_dir=self.output_dir
         )
         self._batch_worker.item_status_changed.connect(self.media_bin.update_item_status)
         self._batch_worker.overall_progress.connect(lambda p, m: (self.progress_bar.setValue(p), self.status_lbl.setText(m)))
         self._batch_worker.log_message.connect(self.log_console.append_log)
 
+        completed_results = []
+        def on_item_completed(v_path, out_mp4):
+            completed_results.append((v_path, out_mp4))
+        self._batch_worker.item_completed.connect(on_item_completed)
+
         def on_batch_done(success, total):
             self.media_bin.set_batch_running(False)
+            if hasattr(self, 'magic_auto_dub_btn') and self.magic_auto_dub_btn:
+                self.magic_auto_dub_btn.setEnabled(True)
+                self.magic_auto_dub_btn.setToolTip("🚀 ដំណើរការស្វ័យប្រវត្តិតែ ១ ចុចគត់ (Auto Subtitle ➔ AI Voiceover ➔ Export Final Video)")
+
             self.progress_bar.setValue(100)
             self.status_lbl.setText(f"Batch Done: {success}/{total}")
-            QMessageBox.information(
-                self, "Batch Complete 🎉",
-                f"ការផលិតវីដេអូជាបាច់ (Batch Dubbing) បានបញ្ចប់!\n\n"
-                f"វីដេអូជោគជ័យ: {success} / {total}\n"
-                f"ទីតាំងរក្សាទុក: {OUTPUT_DIR}"
-            )
-            if sys.platform == "darwin":
-                subprocess.run(["open", str(OUTPUT_DIR)], check=False)
+            
+            # Offer to load last completed dubbed video onto the Studio Timeline
+            target_folder = self.output_dir
+            if success > 0 and completed_results:
+                last_vpath, last_out_mp4 = completed_results[-1]
+                base_name = Path(last_vpath).stem
+                srt_path = os.path.join(target_folder, f"{base_name}_khmer.srt")
+                
+                reply = QMessageBox.question(
+                    self, "Batch Complete 🎉",
+                    f"ការផលិតវីដេអូជាបាច់ (Batch Dubbing) បានបញ្ចប់ដោយជោគជ័យ!\n\n"
+                    f"• វីដេអូជោគជ័យ: {success} / {total}\n"
+                    f"• ទីតាំង Folder: {target_folder}\n\n"
+                    f"តើលោកអ្នកចង់បើកវីដេអូ ({os.path.basename(last_out_mp4)}) មកមើលលើ Timeline និងផ្ទៀងផ្ទាត់ Subtitles ក្នុង Studio ដែរឬទេ?",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes
+                )
+                if reply == QMessageBox.Yes and os.path.exists(last_out_mp4):
+                    self._load_video_file(last_out_mp4, clear_segments=True)
+                    if os.path.exists(srt_path):
+                        try:
+                            from core.srt_translator import SRTTranslator
+                            st = SRTTranslator()
+                            with open(srt_path, "r", encoding="utf-8") as sf:
+                                srt_data = sf.read()
+                            sub_segs = st.parse_srt(srt_data)
+                            loaded_segs = [{"start": s.start_seconds, "end": s.end_seconds, "original_text": s.text, "khmer_text": s.text} for s in sub_segs]
+                            self.transcribed_segments = loaded_segs
+                            self.subtitle_table.set_segments(loaded_segs)
+                            self.timeline_editor.set_segments(loaded_segs)
+                            self.log_console.append_log(f"🎬 [Studio] Loaded dubbed video & {len(loaded_segs)} subtitles onto Timeline.")
+                        except Exception as e_load_sub:
+                            self.log_console.append_log(f"Notice loading subtitles: {e_load_sub}")
+            else:
+                QMessageBox.information(
+                    self, "Batch Complete 🎉",
+                    f"ការផលិតវីដេអូជាបាច់ (Batch Dubbing) បានបញ្ចប់!\n\n"
+                    f"វីដេអូជោគជ័យ: {success} / {total}\n"
+                    f"ទីតាំងរក្សាទុក: {target_folder}"
+                )
+            if sys.platform == "darwin" and os.path.exists(target_folder):
+                subprocess.run(["open", str(target_folder)], check=False)
 
         self._batch_worker.batch_finished.connect(on_batch_done)
         self._batch_worker.start()
@@ -2677,6 +2942,9 @@ class MainWindow(QMainWindow):
         if hasattr(self, '_batch_worker') and self._batch_worker and self._batch_worker.isRunning():
             self._batch_worker.cancel()
             self.media_bin.set_batch_running(False)
+            if hasattr(self, 'magic_auto_dub_btn') and self.magic_auto_dub_btn:
+                self.magic_auto_dub_btn.setEnabled(True)
+                self.magic_auto_dub_btn.setToolTip("🚀 ដំណើរការស្វ័យប្រវត្តិតែ ១ ចុចគត់ (Auto Subtitle ➔ AI Voiceover ➔ Export Final Video)")
             self.status_lbl.setText("Batch cancelled by user.")
 
     def _update_gemini_btn_status(self):
@@ -2757,13 +3025,17 @@ class MainWindow(QMainWindow):
             "Gemini API Key Required 🔑",
             "ដើម្បីបកប្រែពាក្យសំដីជាភាសាខ្មែរ (ភាសានិយាយ) ឱ្យពិរោះតាមបែប Gemini AI\n"
             "សូមបញ្ចូល Gemini API Key របស់អ្នកជាមុនសិន!\n\n"
-            "តើអ្នកចង់បញ្ចូល Gemini API Key ឥឡូវនេះដែរឬទេ?",
-            QMessageBox.Yes | QMessageBox.No
+            "តើអ្នកចង់បញ្ចូល Gemini API Key ឥឡូវនេះដែរឬទេ?\n"
+            "(ប្រសិនបើជ្រើសរើស 'No' កម្មវិធីនឹងប្រើម៉ូដែល Local HY-MT1.5-1.8B ជំនួសវិញ)",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
         )
-        if ret == QMessageBox.Yes:
+        if ret == QMessageBox.StandardButton.Yes:
             self._open_gemini_settings()
             return bool(get_gemini_api_key())
-        return False
+        else:
+            # User opted to use Local HY-MT1.5-1.8B without cloud API key
+            self.log_console.append_log("🤖 [Translation Engine] Gemini Key skipped. Using Local HY-MT1.5-1.8B AI (Apple Silicon MPS).")
+            return True
 
     # ==================== VIDEO BLUR HANDLERS ====================
     def _on_blur_toggled(self, enabled: bool):
@@ -2883,6 +3155,15 @@ class MainWindow(QMainWindow):
                 self.video_preview.set_timeline_segments(self.subtitle_table.segments)
                 self.video_preview._update_display()
 
+    def _on_subtitle_edited_from_screen(self, seg_idx: int, new_text: str):
+        """Handle subtitle text edited directly via double-click on preview canvas."""
+        if hasattr(self, 'subtitle_table'):
+            self.subtitle_table.update_segment_text(seg_idx, new_text)
+        if hasattr(self, 'timeline_editor') and hasattr(self, 'subtitle_table'):
+            self.timeline_editor.set_segments(self.subtitle_table.get_updated_segments())
+        self.log_console.append_log(f"✏️ [CapCut Direct Edit] Subtitle #{seg_idx + 1} updated to: '{new_text}'")
+        self._auto_save_project()
+
     # ==================== VIDEO CUTTING & TRIMMING HANDLERS ====================
     def _on_video_cut_requested(self, cut_info: dict = None):
         """Open the Video Cutter & Trimmer Studio dialog and process user cut request."""
@@ -2950,6 +3231,20 @@ class MainWindow(QMainWindow):
             return
         playhead = getattr(self.timeline_editor.waveform_canvas, 'playhead_pos_sec', 0.0)
         self._on_video_trim_right_requested(playhead)
+
+    def _trigger_shortcut_play_toggle(self):
+        """CapCut Spacebar: Play / Pause toggle."""
+        if self._is_typing_in_input():
+            return
+        if hasattr(self, 'video_preview'):
+            self.video_preview._toggle_play()
+
+    def _trigger_shortcut_rewind_start(self):
+        """CapCut Home: Rewind to 00:00."""
+        if self._is_typing_in_input():
+            return
+        if hasattr(self, 'video_preview'):
+            self.video_preview._stop_video(reset_to_start=True)
 
     def _trigger_shortcut_delete(self):
         """Trigger CapCut-style delete for selected video clip or in/out range."""
@@ -3986,8 +4281,8 @@ class MainWindow(QMainWindow):
             self._set_processing_state(False)
             return
 
-        self._set_processing_state(True, "🌐 Translating segments into natural spoken Khmer via Gemini AI...")
-        self.log_console.append_log("🌐 Translating segments to natural spoken Khmer using Gemini AI...")
+        self._set_processing_state(True, "🌐 Translating segments into natural spoken Khmer...")
+        self.log_console.append_log("🌐 Translating segments into natural spoken Khmer (Gemini Cloud + Local HY-MT1.5-1.8B)...")
         self.progress_bar.setValue(0)
         
         class TranslateWorker(QThread):
@@ -4011,7 +4306,10 @@ class MainWindow(QMainWindow):
                 try:
                     from services.translation_service import TranslationService
                     ts = TranslationService(api_key=self.api_key)
-                    self.log.emit(f"🌐 Translating {len(self.segments)} segments to natural spoken Khmer using Gemini AI...")
+                    if self.api_key:
+                        self.log.emit(f"🌐 Translating {len(self.segments)} segments (Gemini AI Primary | HY-MT1.5 Local Fallback)...")
+                    else:
+                        self.log.emit(f"🤖 Translating {len(self.segments)} segments with Local HY-MT1.5-1.8B AI (Apple Silicon MPS)...")
                     
                     def cb(pct, msg):
                         self.progress.emit(pct, msg)
@@ -4042,10 +4340,31 @@ class MainWindow(QMainWindow):
         self.translate_worker.progress.connect(lambda p, msg: (self.progress_bar.setValue(p), self.status_lbl.setText(msg)))
         self.translate_worker.log.connect(self.log_console.append_log)
         self.translate_worker.finished.connect(self._on_translation_done)
-        self.translate_worker.error.connect(lambda e: (
-            self.log_console.append_log(f"❌ Translation error: {e}"),
+        def on_trans_err(e):
+            self.log_console.append_log(f"❌ Translation error: {e}")
             self._set_processing_state(False, f"❌ Translation error: {e}")
-        ))
+            is_quota = any(k in str(e) for k in ["429", "RESOURCE_EXHAUSTED", "Quota", "quota", "API_KEY_INVALID", "403"])
+            if is_quota:
+                from qt_compat import QInputDialog, QLineEdit
+                new_key, ok = QInputDialog.getText(
+                    self,
+                    "Gemini API Key Quota Reached",
+                    f"⚠️ Gemini API Key របស់អ្នកបានដល់កម្រិតកំណត់ (Error 429: Quota Exhausted)។\n\n"
+                    f"សូមបញ្ចូល Gemini API Key ថ្មី (AIzaSy...) ដើម្បីបន្តការបកប្រែ៖",
+                    QLineEdit.Normal,
+                    ""
+                )
+                if ok and new_key and new_key.strip():
+                    k_clean = new_key.strip()
+                    from utils.config_manager import save_gemini_api_keys
+                    save_gemini_api_keys([k_clean])
+                    os.environ["GEMINI_API_KEY"] = k_clean
+                    self.log_console.append_log(f"🔑 [API Key Updated] Gemini key saved: {k_clean[:8]}... Retrying translation!")
+                    QtCore.QTimer.singleShot(200, self._on_translate_subtitles_clicked)
+                    return
+            QMessageBox.critical(self, "Translation Error", f"កំហុសក្នុងការបកប្រែ:\n{e}")
+
+        self.translate_worker.error.connect(on_trans_err)
         self.translate_worker.start()
 
     def _on_translation_done(self, translated_segments):
@@ -4072,8 +4391,8 @@ class MainWindow(QMainWindow):
             except Exception as e_ksrt:
                 self.log_console.append_log(f"Notice saving Khmer SRT: {e_ksrt}")
 
-        self._set_processing_state(False, "✅ Translation Completed! Original & Khmer SRTs ready.")
-        self.log_console.append_log(f"🎉 Translated {len(translated_segments)} segments into Khmer successfully! (Original text preserved, Khmer text ready)")
+        self._set_processing_state(False, "✅ Translation Completed! Khmer SRT ready.")
+        self.log_console.append_log(f"🎉 Translated {len(translated_segments)} segments into Khmer successfully! (Pure Khmer ready)")
 
     def _open_ai_voice_studio(self):
         from gui.widgets import AIVoiceStudioDialog
@@ -4196,12 +4515,26 @@ class MainWindow(QMainWindow):
 
         # Open Export Settings Dialog for Resolution, Mode, and BGM configuration
         from gui.widgets import ExportSettingsDialog
-        init_res = self.export_res_combo.currentText() if hasattr(self, 'export_res_combo') else "1080P"
+        init_res = "Original"
+        if hasattr(self, 'export_res_combo'):
+            t = self.export_res_combo.currentText()
+            if "Original" in t or "ដើម" in t:
+                init_res = "Original"
+            elif t:
+                init_res = t
         init_mode = self.export_mode_combo.currentText() if hasattr(self, 'export_mode_combo') else "Fast"
         init_bgm = self.bgm_vol_spin.value() if hasattr(self, 'bgm_vol_spin') else 30
         curr_story = self.story_folder_combo.currentText().strip() if hasattr(self, 'story_folder_combo') else "My_Story"
         curr_ep = self.episode_spin.value() if hasattr(self, 'episode_spin') else 1
         curr_out_dir = str(self.output_dir) if hasattr(self, 'output_dir') else os.path.abspath("output")
+
+        # Auto-configured: Burn Subtitles checked (True) by default as required by user workflow
+        if effects_config and "burn_subtitle" in effects_config and "enabled" in effects_config["burn_subtitle"]:
+            init_burn = bool(effects_config["burn_subtitle"]["enabled"])
+        elif hasattr(self, 'video_effects_widget') and hasattr(self.video_effects_widget, 'burn_sub_checkbox'):
+            init_burn = self.video_effects_widget.burn_sub_checkbox.isChecked()
+        else:
+            init_burn = True
 
         dlg = ExportSettingsDialog(
             parent=self,
@@ -4212,13 +4545,24 @@ class MainWindow(QMainWindow):
             story_folder=curr_story,
             episode=curr_ep,
             output_dir=curr_out_dir,
-            timeline_name="Timeline 01"
+            timeline_name="Timeline 01",
+            initial_burn_sub=init_burn
         )
         if dlg.exec() != QDialog.Accepted:
             self.log_console.append_log("ℹ️ ការ Export ត្រូវបានបោះបង់ (Export canceled).")
             return
 
         settings = dlg.get_settings()
+        chosen_burn = bool(settings.get("burn_subtitles", init_burn))
+        if effects_config is None:
+            effects_config = {}
+        if "burn_subtitle" not in effects_config:
+            effects_config["burn_subtitle"] = {}
+        effects_config["burn_subtitle"]["enabled"] = chosen_burn
+        if hasattr(self, 'video_effects_widget') and hasattr(self.video_effects_widget, 'burn_sub_checkbox'):
+            self.video_effects_widget.burn_sub_checkbox.blockSignals(True)
+            self.video_effects_widget.burn_sub_checkbox.setChecked(chosen_burn)
+            self.video_effects_widget.burn_sub_checkbox.blockSignals(False)
         chosen_res = settings.get("resolution", init_res)
         chosen_mode = settings.get("mode", init_mode)
         chosen_bgm = settings.get("bgm_volume", init_bgm)
@@ -4230,9 +4574,8 @@ class MainWindow(QMainWindow):
             self.story_folder_combo.setEditText(new_story)
         if hasattr(self, 'episode_spin'):
             self.episode_spin.setValue(new_ep)
-        if new_out_dir and os.path.exists(new_out_dir):
-            from pathlib import Path
-            self.output_dir = Path(new_out_dir)
+        if new_out_dir and os.path.exists(str(new_out_dir)):
+            self.output_dir = str(new_out_dir)
 
         # Sync bottom bar controls
         if hasattr(self, 'export_res_combo'):
@@ -4261,26 +4604,44 @@ class MainWindow(QMainWindow):
         if effects_config is None:
             effects_config = {}
         effects_config["target_resolution"] = chosen_res
+        effects_config["codec"] = settings.get("codec", "H.264")
+        effects_config["export_mode"] = chosen_mode
 
-        self.log_console.append_log(f"🎬 Export Video Settings: [Resolution: {chosen_res}] [Mode: {chosen_mode}] [BGM: {chosen_bgm}%]")
+        chosen_codec = effects_config["codec"]
+        self.log_console.append_log(f"🎬 Export Video Settings: [Resolution: {chosen_res}] [Codec: {chosen_codec}] [Mode: {chosen_mode}] [BGM: {chosen_bgm}%]")
         self.log_console.append_log("🎬 Exporting Final Khmer Video with Dubbed Audio, Effects, and Custom Resolution...")
         self._start_dubbing_worker(pre_edited_segments=segs, effects_config=effects_config, target_resolution=chosen_res)
 
     def _cancel_export(self):
         if self.worker and self.worker.isRunning():
             self.worker.cancel()
+        if hasattr(self, 'visual_prerender_worker') and self.visual_prerender_worker and self.visual_prerender_worker.isRunning():
+            self.visual_prerender_worker.cancel()
         if hasattr(self, 'voice_worker') and self.voice_worker and self.voice_worker.isRunning():
             self._cancel_voice_generation()
         if self.transcribe_worker and self.transcribe_worker.isRunning():
             self.transcribe_worker.cancel()
         if self.translate_worker and self.translate_worker.isRunning():
             self.translate_worker.cancel()
+        if hasattr(self, '_gemini_worker') and self._gemini_worker and self._gemini_worker.isRunning():
+            try:
+                self._gemini_worker.cancel()
+                self._gemini_worker.wait(200)
+            except Exception:
+                pass
         self._set_processing_state(False, "⚠️ Process canceled by user.")
         self.log_console.append_log("⚠️ Pipeline process canceled by user.")
 
     def _start_dubbing_worker(self, pre_edited_segments=None, effects_config=None, target_resolution=None):
         from utils.file_utils import build_story_export_paths, generate_unique_filename
         
+        # Stop preview player immediately to free 100% of CPU and GPU for export
+        if hasattr(self, 'video_preview') and self.video_preview:
+            try:
+                self.video_preview._stop_video(reset_to_start=False)
+            except Exception:
+                pass
+
         story_name = self.story_folder_combo.currentText().strip() if hasattr(self, 'story_folder_combo') else ""
         if not story_name:
             story_name = "My_Story"
@@ -4322,7 +4683,7 @@ class MainWindow(QMainWindow):
             output_path=out_path,
             source_lang=source_lang,
             target_lang="km",
-            whisper_model="small",
+            whisper_model="base",
             voice_name="VoxCPM2-Khmer",
             api_key=get_gemini_api_key(),
             background_volume=bg_vol,
@@ -4369,6 +4730,16 @@ class MainWindow(QMainWindow):
         if hasattr(self, '_refresh_story_folders'):
             self._refresh_story_folders()
 
+        # 🧹 Auto-clean temporary audio chunks & scratch subtitles upon export completion to save disk & memory
+        try:
+            from utils.file_utils import purge_all_temp_cache, run_memory_cleanup
+            c_cnt, f_mb = purge_all_temp_cache(clear_thumbnails=False)
+            run_memory_cleanup()
+            if c_cnt > 0:
+                self.log_console.append_log(f"🧹 [Auto-Cleanup] បានសម្អាត {c_cnt} ឯកសារបណ្តោះអាសន្ន ({f_mb:.1f} MB freed). Computer storage & memory are clean!")
+        except Exception as e_cl:
+            logger.debug(f"Auto-cleanup error: {e_cl}")
+
         res = QMessageBox.information(self, "Success 🇰🇭", f"Khmer Dubbed Video Exported:\n{output_path}\n\nPlay Video Now?", QMessageBox.Yes | QMessageBox.No)
         if res == QMessageBox.Yes:
             try:
@@ -4388,20 +4759,28 @@ class MainWindow(QMainWindow):
                 pass
 
     def _clear_temp_cache(self):
-        """Clean all cached temporary audio and video files."""
-        from utils.file_utils import TEMP_DIR
-        count = 0
-        if os.path.exists(TEMP_DIR):
-            for fname in os.listdir(TEMP_DIR):
-                fpath = os.path.join(TEMP_DIR, fname)
-                try:
-                    if os.path.isfile(fpath):
-                        os.remove(fpath)
-                        count += 1
-                except Exception:
-                    pass
-        self.log_console.append_log(f"🧹 Cleared {count} temporary cache files.")
-        QMessageBox.information(self, "Cache Cleared", f"បានលុប File បណ្តោះអាសន្នចំនួន {count} Files រួចរាល់!")
+        """Clean all cached temporary audio, video, and draft subtitle files to reclaim disk space."""
+        from utils.file_utils import purge_all_temp_cache, run_memory_cleanup
+        reply = QMessageBox.question(
+            self,
+            "Clear Cache & Scratch Files",
+            "តើលោកអ្នកចង់សម្អាតឯកសារ Audio និង Subtitles បណ្តោះអាសន្នទាំងអស់ ដើម្បីដោះលែងទំហំ Disk Space ដែរឬទេ?\n\n"
+            "✅ វីដេអូសម្រេចដែលបាន Export រួច និងគម្រោងរបស់លោកអ្នក នឹងមិនត្រូវបានប៉ះពាល់ឡើយ។",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        cleaned_count, freed_mb = purge_all_temp_cache(clear_thumbnails=False)
+        run_memory_cleanup()
+        if freed_mb >= 1024:
+            size_str = f"{freed_mb / 1024.0:.2f} GB"
+        else:
+            size_str = f"{freed_mb:.1f} MB"
+
+        msg = f"ជោគជ័យ! បានសម្អាតឯកសារបណ្តោះអាសន្នចំនួន {cleaned_count:,} files\nដោះលែងទំហំ Disk Space បាន {size_str}!"
+        self.log_console.append_log(f"🧹 [Cache Purge] {msg.replace(chr(10), ' ')}")
+        QMessageBox.information(self, "Cache Cleared", msg)
 
     def _import_srt(self):
         file_path, _ = QFileDialog.getOpenFileName(self, "Import SRT", "", "Subtitle Files (*.srt)")
@@ -4657,8 +5036,65 @@ class MainWindow(QMainWindow):
         self.voice_worker.error.connect(self._on_voice_gen_error)
         self.voice_worker.start()
 
+        # Concurrent Background Pre-Render for Video Effects (Blur + Burn Subtitles)
+        self._start_parallel_visual_prerender(segments)
+
+    def _start_parallel_visual_prerender(self, segments: list):
+        """Pre-bake visual effects (Blur + Subtitles + Logo) concurrently while Khmer voices are generating."""
+        if not self.video_path or not os.path.exists(self.video_path):
+            return
+        if not segments:
+            return
+
+        effects_cfg = None
+        if hasattr(self, 'video_effects') and hasattr(self.video_effects, 'get_effects_config'):
+            effects_cfg = self.video_effects.get_effects_config(self.video_preview, segments=segments)
+        elif hasattr(self, 'video_preview') and hasattr(self.video_preview, 'get_effects_config'):
+            effects_cfg = self.video_preview.get_effects_config()
+            if effects_cfg:
+                effects_cfg["segments"] = segments
+
+        if not effects_cfg:
+            return
+
+        b_on = bool(effects_cfg.get("blur", {}).get("enabled", False))
+        t_on = bool(effects_cfg.get("text_overlay", {}).get("enabled", False))
+        l_on = bool(effects_cfg.get("logo", {}).get("enabled", False))
+        s_on = bool(effects_cfg.get("burn_subtitle", {}).get("enabled", False))
+        if not (b_on or t_on or l_on or s_on):
+            return
+
+        from core.visual_prerender import BackgroundVisualPreRenderWorker, is_prerendered_effects_ready
+        if is_prerendered_effects_ready(self.video_path, effects_cfg):
+            self.log_console.append_log("⚡ [Background Pre-Render] Visual effects are already pre-baked! Export will be instant (3-5s).")
+            return
+
+        # Stop existing background prerender worker if running
+        if hasattr(self, 'visual_prerender_worker') and self.visual_prerender_worker and self.visual_prerender_worker.isRunning():
+            try:
+                self.visual_prerender_worker.cancel()
+                self.visual_prerender_worker.wait(200)
+            except Exception:
+                pass
+
+        self.visual_prerender_worker = BackgroundVisualPreRenderWorker(
+            video_path=self.video_path,
+            effects_config=effects_cfg,
+            target_resolution="Original",
+            parent=self
+        )
+        self.visual_prerender_worker.progress.connect(
+            lambda pct, msg: self.log_console.append_log(msg) if (pct % 25 == 0 or pct == 100) else None
+        )
+        self.visual_prerender_worker.finished.connect(
+            lambda path: self.log_console.append_log("✅ [Background Pre-Render] Video effects pre-baked successfully! Export will be instant (3-5s).")
+        )
+        self.visual_prerender_worker.start()
+
     def _cancel_voice_generation(self):
         """Immediately abort active voice synthesis worker and restore UI."""
+        if hasattr(self, 'visual_prerender_worker') and self.visual_prerender_worker and self.visual_prerender_worker.isRunning():
+            self.visual_prerender_worker.cancel()
         if hasattr(self, 'voice_worker') and self.voice_worker and self.voice_worker.isRunning():
             self.voice_worker.cancel()
             self.log_console.append_log("🛑 User requested cancel for Voice Generation. Aborting...")
@@ -4701,30 +5137,48 @@ class MainWindow(QMainWindow):
                     first_speech_sec = st
                     break
 
-        # Automatically switch video preview audio track to "🇰🇭 Khmer Dubbed + BGM" (index 1) and reload mixed audio safely
+        # 1. Immediately switch audio track to 🇰🇭 Dub+BGM and reload mixed audio into player
         if hasattr(self.video_preview, 'audio_track_combo'):
-            self.video_preview.audio_track_combo.blockSignals(True)
             self.video_preview.audio_track_combo.setCurrentIndex(1)
-            self.video_preview.audio_track_combo.blockSignals(False)
-
-        # Seek preview directly to first speech segment so user doesn't wait in silence
-        if hasattr(self.video_preview, 'seek_to_time_sec'):
-            self.video_preview.seek_to_time_sec(first_speech_sec)
 
         if hasattr(self.video_preview, 'reload_mixed_audio'):
             self.video_preview.reload_mixed_audio()
         elif hasattr(self.video_preview, '_load_audio_for_player'):
             self.video_preview._load_audio_for_player()
 
-        # Ensure preview player audio output is completely unmuted & volume 100%
+        # 2. Ensure preview player audio output is completely unmuted & volume 100%
         if hasattr(self.video_preview, 'audio_output'):
             if hasattr(self.video_preview.audio_output, 'setMuted'):
                 self.video_preview.audio_output.setMuted(False)
             if hasattr(self.video_preview.audio_output, 'setVolume'):
                 self.video_preview.audio_output.setVolume(1.0)
 
-        # Trigger background auto-save so user never loses generated audio state
+        # 3. Seek preview directly to first speech segment so user doesn't wait in silence
+        if hasattr(self.video_preview, 'seek_to_time_sec'):
+            self.video_preview.seek_to_time_sec(first_speech_sec)
+
+        # 4. Trigger background auto-save so user never loses generated audio state
         self._auto_save_project()
+
+        # 5. Handle 1-Click Auto Dub Review Mode
+        if getattr(self, '_auto_dub_review_mode', False):
+            self._auto_dub_review_mode = False
+            # Switch to Effects tab so user can customize blur, watermark, subtitle styles
+            if hasattr(self, 'inspector_tabs'):
+                self.inspector_tabs.setCurrentIndex(1)
+            from utils.file_utils import OUTPUT_DIR
+            target_out = getattr(self, 'output_dir', str(OUTPUT_DIR))
+            def _show_dub_ready():
+                QMessageBox.information(
+                    self, "AI Dubbing Complete 🎉",
+                    f"🎉 ការបញ្ចូលសំឡេងខ្មែរ (AI Dubbing) បានរួចរាល់ ១០០%!\n\n"
+                    f"• សំឡេងតួអង្គខ្មែរ និងអត្ថបទ Subtitles ត្រូវបានតម្រឹមត្រូវមាត់រួចជាស្រេច។\n"
+                    f"• ផ្ទាំង Effects (Blur, Subtitles, Logo) ត្រូវបានបើកជូនលោកអ្នកដើម្បីកែសម្រួល។\n\n"
+                    f"ពេលកែសម្រួលពេញចិត្តហើយ សូមចុចប៊ូតុង 'EXPORT' ដើម្បីទាញយកវីដេអូចុងក្រោយទៅកាន់៖\n{target_out}"
+                )
+            from qt_compat import QTimer
+            QTimer.singleShot(250, _show_dub_ready)
+            return
 
         msg_box = QMessageBox(self)
         msg_box.setWindowTitle("Voice Generation Complete")
@@ -4781,26 +5235,14 @@ class MainWindow(QMainWindow):
     def _auto_save_project(self):
         """Silently auto-save current state to output/autosave_project.vproj for disaster recovery."""
         try:
-            import json
             segments = self.subtitle_table.get_updated_segments()
+            if not segments and hasattr(self, 'transcribed_segments') and self.transcribed_segments:
+                segments = self.transcribed_segments
             if not segments and not self.video_path:
                 return
             auto_path = Path(self.output_dir) / "autosave_project.vproj"
-            effects_state = self.video_effects.get_state() if hasattr(self, 'video_effects') else {}
-            bgm_vol = self.bgm_vol_spin.value() if hasattr(self, 'bgm_vol_spin') else 30
-            project_data = {
-                "format": "VideAI_Project",
-                "version": "1.1",
-                "video_path": self.video_path,
-                "output_dir": self.output_dir,
-                "bgm_volume": bgm_vol,
-                "segments": segments,
-                "effects": effects_state,
-                "master_wav": getattr(self, 'last_master_wav', "")
-            }
-            with open(auto_path, "w", encoding="utf-8") as f:
-                json.dump(project_data, f, ensure_ascii=False, indent=2)
-            logger.debug(f"[AutoSave] Project saved to {auto_path}")
+            self._save_project(file_path=str(auto_path), is_auto=True)
+            logger.debug(f"[AutoSave] Silently saved project to {auto_path}")
         except Exception as e:
             logger.debug(f"[AutoSave] Silent error: {e}")
 
@@ -4815,29 +5257,49 @@ class MainWindow(QMainWindow):
             return
         self._open_project(str(auto_path))
 
-    def _save_project(self, file_path: str = None):
-        """Save entire project state into a .vproj (JSON) file."""
+    def _save_project(self, file_path: str = None, is_auto: bool = False):
+        """
+        Save entire project state into a .vproj (JSON) file.
+        Serializes:
+        - Video file and output directory
+        - Story metadata (title, episode)
+        - Multi-clip timeline layout (timeline_clips with paths, cuts, timings, and speeds)
+        - Subtitle & dubbing dialogue segments with full speaker assignments, personas, emotions, styles, and translation status
+        - Speaker profiles aggregated across segments
+        - Transitions between cuts
+        - Video effects state (blur, watermark, text overlay, etc.) and BGM volume
+        - Synthesized master audio track (if generated)
+        """
         import json
+        import math
 
         segments = self.subtitle_table.get_updated_segments()
-        if not self.video_path and not segments:
-            QMessageBox.information(
-                self, "Save Project",
-                "គ្មានទិន្នន័យគម្រោងដែលត្រូវរក្សាទុកទេ (សូមបើកវីដេអូ ឬនាំចូល Subtitle ជាមុនសិន)។"
-            )
+        if not segments and hasattr(self, 'transcribed_segments') and self.transcribed_segments:
+            segments = self.transcribed_segments
+
+        timeline_clips = self._get_current_timeline_clips()
+        if not self.video_path and not segments and not timeline_clips:
+            if not is_auto:
+                QMessageBox.information(
+                    self, "Save Project",
+                    "គ្មានទិន្នន័យគម្រោងដែលត្រូវរក្សាទុកទេ (សូមបើកវីដេអូ ឬនាំចូល Subtitle ជាមុនសិន)។"
+                )
             return
 
         target_file = file_path or self.current_project_file
         if not target_file:
-            base_stem = Path(self.video_path).stem if self.video_path else "khmer_translation"
-            default_name = f"{base_stem}_project.vproj"
-            target_file, _ = QFileDialog.getSaveFileName(
-                self, "Save Vide AI Project",
-                str(Path(self.output_dir) / default_name),
-                "Vide AI Project (*.vproj *.json)"
-            )
-            if not target_file:
-                return
+            if is_auto:
+                target_file = str(Path(self.output_dir) / "autosave_project.vproj")
+            else:
+                base_stem = Path(self.video_path).stem if self.video_path else "khmer_translation"
+                default_name = f"{base_stem}_project.vproj"
+                target_file, _ = QFileDialog.getSaveFileName(
+                    self, "Save Vide AI Project",
+                    str(Path(self.output_dir) / default_name),
+                    "Vide AI Project (*.vproj *.json)"
+                )
+                if not target_file:
+                    return
 
         # Ensure .vproj extension if none provided
         if not target_file.endswith(".vproj") and not target_file.endswith(".json"):
@@ -4846,7 +5308,21 @@ class MainWindow(QMainWindow):
         effects_state = self.video_effects.get_state() if hasattr(self, 'video_effects') else {}
         bgm_vol = self.bgm_vol_spin.value() if hasattr(self, 'bgm_vol_spin') else 30
 
-        # Pillar 1 & 2: Aggregate Speaker Profiles dictionary
+        # Multi-clip timeline serialization
+        serialized_clips = []
+        for c in timeline_clips:
+            if isinstance(c, dict):
+                c_path = str(c.get("path", "") or "")
+                serialized_clips.append({
+                    "name": str(c.get("name", os.path.basename(c_path))),
+                    "path": c_path,
+                    "start": float(c.get("start", 0.0)),
+                    "duration": float(c.get("duration", 0.0)),
+                    "source_in": float(c.get("source_in", 0.0)),
+                    "speed": float(c.get("speed", 1.0))
+                })
+
+        # Speaker Profiles dictionary
         speakers = {}
         for seg in segments:
             spk_id = seg.get("speaker_id") or "speaker_01"
@@ -4864,7 +5340,6 @@ class MainWindow(QMainWindow):
                 }
 
         # Collect and serialize transition entities
-        import math
         serialized_transitions = []
         if hasattr(self, 'transitions') and self.transitions:
             for cut_idx, trans in self.transitions.items():
@@ -4903,43 +5378,71 @@ class MainWindow(QMainWindow):
                 except Exception as ex:
                     logger.warning(f"⚠️ [Project] Could not serialize transition at cut {cut_idx}: {ex}")
 
+        # Story and stats metadata
+        story_title = self.story_folder_combo.currentText() if hasattr(self, 'story_folder_combo') else ""
+        episode_num = self.episode_spin.value() if hasattr(self, 'episode_spin') else 1
+        khmer_translated_count = sum(1 for s in segments if any(0x1780 <= ord(c) <= 0x17FF for c in (s.get("translated_text", "") or s.get("khmer_text", "") or "")))
+
         project_data = {
             "format": "VideAI_Project",
-            "version": "2.1",
-            "video_path": self.video_path,
-            "output_dir": self.output_dir,
-            "bgm_volume": bgm_vol,
+            "version": "2.2",
+            "video_path": str(self.video_path) if self.video_path else "",
+            "story_title": str(story_title),
+            "episode": int(episode_num),
+            "output_dir": str(self.output_dir) if self.output_dir else "",
+            "bgm_volume": int(bgm_vol),
+            "timeline_clips": serialized_clips,
             "speakers": speakers,
             "segments": segments,
             "effects": effects_state,
-            "master_wav": getattr(self, 'last_master_wav', ""),
-            "transitions": serialized_transitions
+            "master_wav": str(getattr(self, 'last_master_wav', "") or ""),
+            "transitions": serialized_transitions,
+            "stats": {
+                "total_segments": len(segments),
+                "translated_segments": khmer_translated_count,
+                "total_clips": len(serialized_clips)
+            }
         }
+
+        def _json_safe_default(obj):
+            if isinstance(obj, (Path, os.PathLike)):
+                return str(obj)
+            if hasattr(obj, 'to_dict'):
+                return obj.to_dict()
+            return str(obj)
 
         temp_target = f"{target_file}.tmp"
         try:
             with open(temp_target, "w", encoding="utf-8") as f:
-                json.dump(project_data, f, ensure_ascii=False, indent=2)
+                json.dump(project_data, f, ensure_ascii=False, indent=2, default=_json_safe_default)
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(temp_target, target_file)
 
-            self.current_project_file = target_file
-            proj_name = Path(target_file).name
-            self.setWindowTitle(f"🎬 Vide AI Studio - [{proj_name}]")
-            self.status_lbl.setText(f"💾 Project saved: {proj_name}")
-            self.log_console.append_log(f"💾 [Project] Saved project successfully: {target_file} ({len(serialized_transitions)} transition(s) saved)")
+            if not is_auto:
+                self.current_project_file = target_file
+                proj_name = Path(target_file).name
+                self.setWindowTitle(f"🎬 Vide AI Studio - [{proj_name}]")
+                self.status_lbl.setText(f"💾 Project saved: {proj_name}")
+                self.log_console.append_log(
+                    f"💾 [Project] Saved project successfully: {target_file} "
+                    f"({len(segments)} segments, {khmer_translated_count} translated, "
+                    f"{len(serialized_clips)} clip(s), {len(serialized_transitions)} transition(s))"
+                )
 
-            # Show brief confirmation if manually saved
-            if not file_path:
+                # Show confirmation dialog
                 QMessageBox.information(
                     self, "Project Saved",
                     f"✅ គម្រោងត្រូវបានរក្សាទុកដោយជោគជ័យ!\n\n"
                     f"📁 ឯកសារ: {proj_name}\n"
+                    f"🎬 ចំនួន Video Clip: {len(serialized_clips)} clip(s)\n"
                     f"📝 ចំនួនឃ្លា Subtitle: {len(segments)} ជួរ\n"
+                    f"🌐 បកប្រែរួច: {khmer_translated_count} / {len(segments)} ជួរ\n"
                     f"⧓ ចំនួន Transition: {len(serialized_transitions)} កន្លែង\n\n"
-                    f"លោកអ្នកអាចបើកវាមកកែប្រែបន្តនៅពេលក្រោយបានគ្រប់ពេលវេលា (Cmd+O) ដោយមិនបាច់ចាប់ផ្តើមពីសូន្យឡើយ។"
+                    f"លោកអ្នកអាចបិទកម្មវិធី ហើយត្រឡប់មកបើកបន្ត (Cmd+O) នៅពេលក្រោយបានគ្រប់ពេលវេលា ដោយមិនបាត់បង់ទិន្នន័យឡើយ!"
                 )
+            else:
+                logger.debug(f"[AutoSave] Silently saved to {target_file}")
         except Exception as e:
             if os.path.exists(temp_target):
                 try:
@@ -4947,7 +5450,8 @@ class MainWindow(QMainWindow):
                 except Exception:
                     pass
             self.log_console.append_log(f"❌ [Project] Failed to save project: {e}")
-            QMessageBox.critical(self, "Save Error", f"មិនអាចរក្សាទុកគម្រោងបានទេ:\n{str(e)}")
+            if not is_auto:
+                QMessageBox.critical(self, "Save Error", f"មិនអាចរក្សាទុកគម្រោងបានទេ:\n{str(e)}")
 
     def _open_project(self, file_path: str = None):
         """Open and restore project state from a .vproj (JSON) file."""
@@ -4967,21 +5471,23 @@ class MainWindow(QMainWindow):
             with open(target_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
 
+            proj_dir = Path(target_file).parent
             video_path = data.get("video_path")
             if video_path and not os.path.exists(video_path):
-                # Try finding in the same folder as the project file
-                proj_dir = Path(target_file).parent
-                candidate = proj_dir / Path(video_path).name
-                ws_candidate = Path(os.getcwd()) / Path(video_path).name
-                temp_candidate = Path(os.getcwd()) / "temp" / f"safe_input_{Path(video_path).name}"
-
-                if candidate.exists():
-                    video_path = str(candidate)
-                elif ws_candidate.exists():
-                    video_path = str(ws_candidate)
-                elif temp_candidate.exists():
-                    video_path = str(temp_candidate)
-                else:
+                candidates = [
+                    proj_dir / Path(video_path).name,
+                    Path(os.getcwd()) / Path(video_path).name,
+                    Path(os.getcwd()) / "temp" / Path(video_path).name,
+                    Path(os.getcwd()) / "temp" / f"safe_input_{Path(video_path).name}",
+                ]
+                found = False
+                for cand in candidates:
+                    if cand.exists():
+                        video_path = str(cand)
+                        found = True
+                        break
+                
+                if not found:
                     reply = QMessageBox.question(
                         self, "Video File Missing",
                         f"មិនអាចរកឃើញឯកសារវីដេអូនៅទីតាំងដើម:\n{video_path}\n\n"
@@ -5005,12 +5511,64 @@ class MainWindow(QMainWindow):
             if video_path and os.path.exists(video_path):
                 self._load_video_file(video_path, clear_segments=False)
 
+            # Restore Multi-Clip Timeline layout
+            raw_clips = data.get("timeline_clips", [])
+            restored_clips = []
+            if raw_clips and isinstance(raw_clips, list):
+                for c in raw_clips:
+                    if not isinstance(c, dict):
+                        continue
+                    c_path = c.get("path", "")
+                    if c_path and not os.path.exists(c_path):
+                        cand_c1 = proj_dir / Path(c_path).name
+                        cand_c2 = Path(os.getcwd()) / "temp" / Path(c_path).name
+                        cand_c3 = Path(os.getcwd()) / Path(c_path).name
+                        if cand_c1.exists():
+                            c_path = str(cand_c1)
+                        elif cand_c2.exists():
+                            c_path = str(cand_c2)
+                        elif cand_c3.exists():
+                            c_path = str(cand_c3)
+                    restored_clips.append({
+                        "name": c.get("name", os.path.basename(c_path)),
+                        "path": c_path,
+                        "start": float(c.get("start", 0.0)),
+                        "duration": float(c.get("duration", 0.0)),
+                        "source_in": float(c.get("source_in", 0.0)),
+                        "speed": float(c.get("speed", 1.0))
+                    })
+                if restored_clips:
+                    self._current_merged_clips = restored_clips
+                    if hasattr(self, 'timeline_editor'):
+                        self.timeline_editor.set_video_clips(restored_clips, video_path=video_path)
+                    if hasattr(self, 'video_preview'):
+                        self.video_preview.set_video_clips(restored_clips)
+                    if hasattr(self, 'timeline_model'):
+                        self.timeline_model.video_clips = restored_clips
+                    if hasattr(self, 'media_bin'):
+                        self.media_bin.sync_timeline_clips(restored_clips)
+                    tot_d = getattr(self, 'video_duration', 0.0)
+                    self._update_inspector_details(video_path, clips=restored_clips, duration=tot_d)
+
+            # Restore story title & episode
+            if "story_title" in data and hasattr(self, 'story_folder_combo') and data["story_title"]:
+                self.story_folder_combo.setEditText(data["story_title"])
+            if "episode" in data and hasattr(self, 'episode_spin'):
+                try:
+                    self.episode_spin.setValue(int(data["episode"]))
+                except Exception:
+                    pass
+
             # Restore segments
             segments = data.get("segments", [])
             self.transcribed_segments = segments
             self.subtitle_table.set_segments(segments)
-            self.timeline_editor.set_segments(segments)
-            self.video_preview.set_timeline_segments(segments)
+            if hasattr(self, 'timeline_editor'):
+                self.timeline_editor.set_segments(segments)
+            if hasattr(self, 'video_preview'):
+                self.video_preview.set_timeline_segments(segments)
+            if hasattr(self, 'timeline_model'):
+                self.timeline_model.segments = segments
 
             # Restore BGM volume
             if "bgm_volume" in data and hasattr(self, 'bgm_vol_spin'):
@@ -5038,13 +5596,11 @@ class MainWindow(QMainWindow):
             if isinstance(raw_transitions, list):
                 for item in raw_transitions:
                     if not isinstance(item, dict):
-                        self.log_console.append_log("⚠️ [Project] Skipped invalid non-dictionary transition entry.")
                         continue
                     try:
                         c_idx = int(item["cut_index"])
                         dur = float(item.get("duration", 1.0))
                         if not math.isfinite(dur) or dur <= 0.0:
-                            self.log_console.append_log(f"⚠️ [Project] Skipped transition cut {c_idx}: invalid duration {dur}")
                             continue
 
                         t_type = str(item.get("type", "cross_dissolve"))
@@ -5082,8 +5638,6 @@ class MainWindow(QMainWindow):
                         restored_transitions[c_idx] = trans_obj
                     except (KeyError, ValueError, TypeError) as ex:
                         self.log_console.append_log(f"⚠️ [Project] Corrupted transition entry skipped: {ex}")
-            else:
-                self.log_console.append_log("ℹ️ [Project] No transition list in project file (backward compatibility).")
 
             self.transitions = restored_transitions
             if hasattr(self, 'timeline_model'):
@@ -5112,11 +5666,16 @@ class MainWindow(QMainWindow):
                     self.video_preview._load_audio_for_player()
                 self.log_console.append_log(f"🔊 [Project] Restored synthesized audio track: {os.path.basename(master_wav)}")
 
+            # Statistics & UI Notification
+            khmer_count = sum(1 for s in segments if any(0x1780 <= ord(c) <= 0x17FF for c in (s.get("translated_text", "") or s.get("khmer_text", "") or "")))
             self.current_project_file = target_file
             proj_name = Path(target_file).name
             self.setWindowTitle(f"🎬 Vide AI Studio - [{proj_name}]")
-            self.status_lbl.setText(f"📂 Opened project: {proj_name}")
-            self.log_console.append_log(f"📂 [Project] Opened project: {target_file} ({len(segments)} segments loaded)")
+            self.status_lbl.setText(f"📂 Opened: {proj_name} | {len(segments)} lines ({khmer_count} translated)")
+            self.log_console.append_log(
+                f"📂 [Project] Opened project: {target_file} "
+                f"({len(segments)} segments, {khmer_count} translated, {len(restored_clips)} clip(s))"
+            )
 
             vid_info = Path(video_path).name if video_path else "មិនទាន់ភ្ជាប់វីដេអូ"
             QMessageBox.information(
@@ -5124,8 +5683,10 @@ class MainWindow(QMainWindow):
                 f"✅ បានបើកគម្រោងដោយជោគជ័យ!\n\n"
                 f"📁 ឯកសារ: {proj_name}\n"
                 f"📹 វីដេអូ: {vid_info}\n"
-                f"📝 ចំនួនឃ្លា Subtitle: {len(segments)} ជួរ\n\n"
-                f"លោកអ្នកអាចបន្តកែប្រែ ឬបន្ថែមសំឡេងបានភ្លាមៗ!"
+                f"🎬 ចំនួន Video Clip: {len(restored_clips)} clip(s)\n"
+                f"📝 ចំនួនឃ្លា Subtitle: {len(segments)} ជួរ\n"
+                f"🌐 បកប្រែរួច: {khmer_count} / {len(segments)} ជួរ\n\n"
+                f"លោកអ្នកអាចបន្តកែប្រែ បកប្រែបន្ថែម ឬ Generate Dubbing បានភ្លាមៗ!"
             )
         except Exception as e:
             self.log_console.append_log(f"❌ [Project] Failed to open project: {e}")
@@ -5137,7 +5698,7 @@ class MainWindow(QMainWindow):
             self._auto_save_project()
         except Exception:
             pass
-        for worker in [getattr(self, 'worker', None), getattr(self, 'voice_worker', None), getattr(self, 'transcribe_worker', None), getattr(self, 'translate_worker', None), getattr(self, 'mp3_worker', None), getattr(self, 'react_worker', None)]:
+        for worker in [getattr(self, 'worker', None), getattr(self, '_gemini_worker', None), getattr(self, 'voice_worker', None), getattr(self, 'visual_prerender_worker', None), getattr(self, 'transcribe_worker', None), getattr(self, 'translate_worker', None), getattr(self, 'mp3_worker', None), getattr(self, 'react_worker', None)]:
             if worker and worker.isRunning():
                 try:
                     if hasattr(worker, 'cancel'):

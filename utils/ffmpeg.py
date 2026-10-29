@@ -5,57 +5,16 @@ import shutil
 from pathlib import Path
 from utils.logger import logger
 
-import sys
-
-def get_ffmpeg_executable() -> str:
-    """Find absolute or resolved path to ffmpeg executable across system PATH and bundled folders."""
-    # 1. System PATH
-    found = shutil.which("ffmpeg") or shutil.which("ffmpeg.exe")
-    if found:
-        return found
-    # 2. Check frozen bundle and local directories
-    candidate_bases = [
-        getattr(sys, '_MEIPASS', None),
-        os.path.dirname(os.path.abspath(sys.executable if getattr(sys, 'frozen', False) else __file__)),
-        os.path.join(os.path.dirname(os.path.abspath(sys.executable if getattr(sys, 'frozen', False) else __file__)), "_internal"),
-        os.path.abspath(os.path.join(os.path.dirname(__file__), "..")),
-    ]
-    for base in candidate_bases:
-        if base:
-            candidate = os.path.join(base, "ffmpeg.exe" if sys.platform == "win32" else "ffmpeg")
-            if os.path.exists(candidate):
-                return candidate
-    return "ffmpeg.exe" if sys.platform == "win32" else "ffmpeg"
-
-def get_ffprobe_executable() -> str:
-    """Find absolute or resolved path to ffprobe executable across system PATH and bundled folders."""
-    found = shutil.which("ffprobe") or shutil.which("ffprobe.exe")
-    if found:
-        return found
-    candidate_bases = [
-        getattr(sys, '_MEIPASS', None),
-        os.path.dirname(os.path.abspath(sys.executable if getattr(sys, 'frozen', False) else __file__)),
-        os.path.join(os.path.dirname(os.path.abspath(sys.executable if getattr(sys, 'frozen', False) else __file__)), "_internal"),
-        os.path.abspath(os.path.join(os.path.dirname(__file__), "..")),
-    ]
-    for base in candidate_bases:
-        if base:
-            candidate = os.path.join(base, "ffprobe.exe" if sys.platform == "win32" else "ffprobe")
-            if os.path.exists(candidate):
-                return candidate
-    return "ffprobe.exe" if sys.platform == "win32" else "ffprobe"
-
 def is_ffmpeg_available() -> bool:
-    """Check if ffmpeg command is available in system path or local directory."""
-    ffmpeg_bin = get_ffmpeg_executable()
+    """Check if ffmpeg command is available in system path."""
     try:
-        res = subprocess.run([ffmpeg_bin, "-version"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        res = subprocess.run(["ffmpeg", "-version"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         return res.returncode == 0
     except Exception:
         return False
 
 def get_safe_ffmpeg_threads() -> int:
-    """Return safe thread count (1 to 4) to prevent CPU starvation and system freezes."""
+    """Return safe thread count (1 to 4) to prevent CPU starvation and macOS system freezes."""
     cores = os.cpu_count() or 4
     return max(1, min(4, cores // 2))
 
@@ -68,31 +27,23 @@ def safe_run_ffmpeg(cmd: list, timeout: float = None) -> subprocess.CompletedPro
         except Exception:
             pass
 
-    cmd_copy = list(cmd)
-    if len(cmd_copy) > 0:
-        if cmd_copy[0] in ("ffmpeg", "ffmpeg.exe"):
-            cmd_copy[0] = get_ffmpeg_executable()
-        elif cmd_copy[0] in ("ffprobe", "ffprobe.exe"):
-            cmd_copy[0] = get_ffprobe_executable()
-
-    if "-threads" not in cmd_copy and len(cmd_copy) > 1 and ("ffmpeg" in cmd_copy[0] or "ffmpeg.exe" in cmd_copy[0]):
-        cmd_copy = [cmd_copy[0], "-threads", str(get_safe_ffmpeg_threads())] + cmd_copy[1:]
-
-    preexec = _safe_preexec if sys.platform != "win32" else None
+    if "-threads" not in cmd and len(cmd) > 1 and cmd[0] == "ffmpeg":
+        cmd = [cmd[0], "-threads", str(get_safe_ffmpeg_threads())] + cmd[1:]
 
     return subprocess.run(
-        cmd_copy,
+        cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
         timeout=timeout,
-        preexec_fn=preexec
+        preexec_fn=_safe_preexec
     )
+
 
 def get_video_info(video_path: str) -> dict:
     """Get metadata about video file (duration, resolution, audio presence)."""
     cmd = [
-        get_ffprobe_executable(),
+        "ffprobe",
         "-v", "error",
         "-print_format", "json",
         "-show_format",
@@ -429,9 +380,21 @@ def are_clips_strictly_compatible_for_lossless_concat(video_paths: list) -> bool
     Check if video files have 100% matching codecs, resolutions, aspect ratios,
     framerate, and audio parameters so that direct '-c copy' concat demuxer
     produces a 100% valid, glitch-free, synchronized video.
+    Strict equality is enforced: even 1px or 1fps discrepancy triggers hardware normalization
+    so video decoders never stall or freeze mid-stream.
     """
     if len(video_paths) <= 1:
         return True
+
+    def _parse_fps(raw) -> float:
+        if not raw: return 30.0
+        try:
+            if "/" in str(raw):
+                num, den = str(raw).split("/", 1)
+                return float(num) / float(den) if float(den) > 0 else 30.0
+            return float(raw)
+        except Exception:
+            return 30.0
 
     first_info = None
     for p in video_paths:
@@ -453,31 +416,39 @@ def are_clips_strictly_compatible_for_lossless_concat(video_paths: list) -> bool
             if not v_stream:
                 return False
 
+            w = int(v_stream.get("width") or 0)
+            h = int(v_stream.get("height") or 0)
+            fps_val = _parse_fps(v_stream.get("r_frame_rate"))
+
             sig = {
                 "v_codec": v_stream.get("codec_name"),
                 "v_profile": v_stream.get("profile"),
-                "width": v_stream.get("width"),
-                "height": v_stream.get("height"),
-                "fps": v_stream.get("r_frame_rate"),
+                "width": w,
+                "height": h,
+                "fps": round(fps_val, 2),
                 "has_audio": (a_stream is not None),
                 "a_codec": a_stream.get("codec_name") if a_stream else None,
                 "a_profile": a_stream.get("profile") if a_stream else None,
-                "sample_rate": a_stream.get("sample_rate") if a_stream else None,
-                "channels": a_stream.get("channels") if a_stream else None,
+                "sample_rate": int(a_stream.get("sample_rate") or 0) if a_stream else 0,
+                "channels": int(a_stream.get("channels") or 0) if a_stream else 0,
             }
             if first_info is None:
                 first_info = sig
             else:
-                h_diff = abs(int(sig.get("height") or 0) - int(first_info.get("height") or 0))
-                w_diff = abs(int(sig.get("width") or 0) - int(first_info.get("width") or 0))
-                if (sig["v_codec"] != first_info["v_codec"] or
-                    w_diff > 4 or
-                    h_diff > 8 or
-                    sig["fps"] != first_info["fps"] or
-                    sig["has_audio"] != first_info["has_audio"] or
+                # STRICT equality: even 1 pixel or 1 fps difference triggers normalization
+                if sig["v_codec"] != first_info["v_codec"]:
+                    return False
+                if sig["width"] != first_info["width"] or sig["height"] != first_info["height"]:
+                    return False
+                if abs(sig["fps"] - first_info["fps"]) > 0.05:
+                    return False
+                if sig["has_audio"] != first_info["has_audio"]:
+                    return False
+                if sig["has_audio"] and (
                     sig["a_codec"] != first_info["a_codec"] or
                     sig["sample_rate"] != first_info["sample_rate"] or
-                    sig["channels"] != first_info["channels"]):
+                    sig["channels"] != first_info["channels"]
+                ):
                     return False
         except Exception:
             return False
@@ -577,42 +548,64 @@ def merge_multiple_videos(
                 try: os.remove(list_file)
                 except Exception: pass
 
-    # 3. Smooth Sequential Normalization (processes clips one by one to avoid CPU/RAM lag)
+    # 3. High-Speed Concurrent Normalization (Apple VideoToolbox / Multi-Worker Engine)
     temp_dir = tempfile.mkdtemp(prefix="merge_norm_")
-    norm_clips = []
+    norm_clips = [None] * n
     try:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import threading
+
         v_codec = "h264_videotoolbox" if sys.platform == "darwin" else "libx264"
+        max_workers = min(4, max(2, (os.cpu_count() or 4) // 2))
+        completed_count = 0
+        progress_lock = threading.Lock()
 
-        for i, p in enumerate(video_paths):
+        def _normalize_single_clip(i: int, p: str):
+            nonlocal completed_count
             if is_cancelled and is_cancelled():
-                logger.info("Merge cancelled by user during normalization.")
-                return False
-
-            pct = int(10 + (i / float(n)) * 80)
-            base_name = os.path.basename(p)
-            if len(base_name) > 20:
-                base_name = base_name[:17] + "..."
-            if progress_callback:
-                progress_callback(pct, f"⚙️ កំពុងរៀបចំ Clip {i+1}/{n} ({base_name})...")
+                return i, None
 
             norm_clip_path = os.path.join(temp_dir, f"clip_{i:04d}.mp4")
             inf = infos[i]
             has_a = inf.get("has_audio", True)
+            cur_w = int(inf.get("width") or 0)
+            cur_h = int(inf.get("height") or 0)
+            cur_fps = inf.get("fps", 30.0)
+            try:
+                cur_fps_val = float(cur_fps)
+            except Exception:
+                cur_fps_val = 30.0
 
-            # High-performance single-clip normalization filter
-            vf = (
-                f"scale={ref_w}:{ref_h}:force_original_aspect_ratio=decrease,"
-                f"pad={ref_w}:{ref_h}:(ow-iw)/2:(oh-ih)/2:color=black,"
-                f"setsar=1,fps=30"
-            )
+            # Check if dimensions already match target
+            already_exact_dim = (cur_w == ref_w and cur_h == ref_h)
+            already_exact_fps = abs(cur_fps_val - 30.0) < 0.05
+
+            if already_exact_dim and already_exact_fps:
+                vf = "setsar=1"
+            else:
+                vf = (
+                    f"scale={ref_w}:{ref_h}:force_original_aspect_ratio=decrease,"
+                    f"pad={ref_w}:{ref_h}:(ow-iw)/2:(oh-ih)/2:color=black,"
+                    f"setsar=1,fps=30"
+                )
+
             cmd_norm = ["ffmpeg", "-y", "-i", p, "-vf", vf]
 
             if v_codec == "libx264":
-                cmd_norm.extend(["-c:v", "libx264", "-preset", "ultrafast", "-crf", "20", "-pix_fmt", "yuv420p"])
+                cmd_norm.extend(["-c:v", "libx264", "-preset", "ultrafast", "-crf", "20", "-pix_fmt", "yuv420p", "-threads", "2"])
             else:
-                cmd_norm.extend(["-c:v", "h264_videotoolbox", "-b:v", "3500k", "-pix_fmt", "yuv420p", "-color_range", "1"])
+                # VideoToolbox: high-speed hardware accelerated on Apple Silicon
+                cmd_norm.extend(["-c:v", "h264_videotoolbox", "-b:v", "3500k", "-pix_fmt", "yuv420p", "-color_range", "1", "-realtime", "0", "-allow_sw", "1"])
 
-            if has_a:
+            # Smart Audio: if already AAC 48000Hz stereo, stream-copy audio directly
+            a_codec = str(inf.get("a_codec", "")).lower()
+            a_sr = int(inf.get("sample_rate") or 0)
+            a_ch = int(inf.get("channels") or 0)
+            already_ideal_audio = (has_a and "aac" in a_codec and a_sr == 48000 and a_ch == 2)
+
+            if already_ideal_audio:
+                cmd_norm.extend(["-c:a", "copy"])
+            elif has_a:
                 cmd_norm.extend([
                     "-af", "aformat=sample_rates=48000:channel_layouts=stereo",
                     "-c:a", "aac", "-b:a", "192k"
@@ -629,23 +622,44 @@ def merge_multiple_videos(
 
             res_norm = safe_run_ffmpeg(cmd_norm)
             if res_norm.returncode != 0 or not os.path.exists(norm_clip_path) or os.path.getsize(norm_clip_path) < 1024:
-                # If videotoolbox failed, fallback smoothly to libx264
+                # If videotoolbox failed, fallback to libx264
                 if v_codec != "libx264":
-                    cmd_norm_fallback = ["ffmpeg", "-y", "-i", p, "-vf", vf, "-c:v", "libx264", "-preset", "ultrafast", "-crf", "20", "-pix_fmt", "yuv420p"]
-                    if has_a:
-                        cmd_norm_fallback.extend(["-af", "aformat=sample_rates=48000:channel_layouts=stereo", "-c:a", "aac", "-b:a", "192k"])
-                    cmd_norm_fallback.append(norm_clip_path)
-                    res_fallback = safe_run_ffmpeg(cmd_norm_fallback)
+                    cmd_fallback = ["ffmpeg", "-y", "-i", p, "-vf", vf, "-c:v", "libx264", "-preset", "ultrafast", "-crf", "20", "-pix_fmt", "yuv420p", "-threads", "2"]
+                    if already_ideal_audio:
+                        cmd_fallback.extend(["-c:a", "copy"])
+                    elif has_a:
+                        cmd_fallback.extend(["-af", "aformat=sample_rates=48000:channel_layouts=stereo", "-c:a", "aac", "-b:a", "192k"])
+                    cmd_fallback.append(norm_clip_path)
+                    res_fallback = safe_run_ffmpeg(cmd_fallback)
                     if res_fallback.returncode != 0 or not os.path.exists(norm_clip_path):
-                        err_tail = res_fallback.stderr.strip()[-300:] if res_fallback.stderr else "Unknown error"
-                        logger.error(f"Failed to normalize clip {i}: {err_tail}")
-                        return False
+                        logger.error(f"Failed to normalize clip {i}")
+                        return i, None
                 else:
-                    err_tail = res_norm.stderr.strip()[-300:] if res_norm.stderr else "Unknown error"
-                    logger.error(f"Failed to normalize clip {i}: {err_tail}")
-                    return False
+                    logger.error(f"Failed to normalize clip {i}")
+                    return i, None
 
-            norm_clips.append(norm_clip_path)
+            with progress_lock:
+                completed_count += 1
+                if progress_callback:
+                    pct = int(10 + (completed_count / float(n)) * 82)
+                    base_name = os.path.basename(p)
+                    if len(base_name) > 20:
+                        base_name = base_name[:17] + "..."
+                    progress_callback(pct, f"⚡ រៀបចំ Clip {completed_count}/{n} (ស្របគ្នា {max_workers} clips) - {base_name}")
+
+            return i, norm_clip_path
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_idx = {executor.submit(_normalize_single_clip, idx, path): idx for idx, path in enumerate(video_paths)}
+            for future in as_completed(future_to_idx):
+                if is_cancelled and is_cancelled():
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    return False
+                idx_res, clip_out = future.result()
+                if not clip_out:
+                    logger.error(f"Normalization failed for clip index {idx_res}")
+                    return False
+                norm_clips[idx_res] = clip_out
 
         if is_cancelled and is_cancelled():
             return False

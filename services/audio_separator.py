@@ -148,50 +148,64 @@ def create_clean_background_track(
     3. Smooth Hann (raised-cosine) 45ms crossfades prevent clicks, pops, or abrupt transitions.
     """
     import math
+    import wave
     import numpy as np
-    from pydub import AudioSegment
 
     if not orig_audio_path or not os.path.exists(orig_audio_path):
         raise FileNotFoundError(f"Original audio not found: {orig_audio_path}")
 
-    audio = AudioSegment.from_file(orig_audio_path).set_frame_rate(44100).set_channels(2)
     sr = 44100
-
-    # Scale overall baseline background volume
+    channels = 2
     clamped_vol = max(0.01, min(1.0, float(bgm_volume)))
-    raw_samples = np.frombuffer(audio.raw_data, dtype=np.int16).reshape(-1, 2).astype(np.float32)
-    total_samples = len(raw_samples)
 
-    if not segments or total_samples == 0:
-        audio_scaled = audio + (20 * math.log10(clamped_vol))
-        audio_scaled.export(output_bgm_path, format="wav")
-        return output_bgm_path
+    # Ensure source audio is a clean 44.1kHz 16-bit stereo PCM WAV
+    temp_conv_wav = None
+    is_standard_wav = False
+    try:
+        with wave.open(orig_audio_path, "rb") as wf_check:
+            if wf_check.getframerate() == sr and wf_check.getnchannels() == channels and wf_check.getsampwidth() == 2:
+                is_standard_wav = True
+    except Exception:
+        is_standard_wav = False
+
+    active_in_wav = orig_audio_path
+    if not is_standard_wav:
+        temp_conv_wav = get_temp_path("temp_bgm_norm_44k.wav")
+        cmd_conv = [
+            "ffmpeg", "-y", "-i", orig_audio_path,
+            "-vn", "-acodec", "pcm_s16le", "-ar", str(sr), "-ac", str(channels),
+            temp_conv_wav
+        ]
+        res_c = subprocess.run(cmd_conv, capture_output=True, check=False)
+        if res_c.returncode == 0 and os.path.exists(temp_conv_wav) and os.path.getsize(temp_conv_wav) > 100:
+            active_in_wav = temp_conv_wav
+        else:
+            from pydub import AudioSegment
+            audio = AudioSegment.from_file(orig_audio_path).set_frame_rate(sr).set_channels(channels)
+            audio.export(temp_conv_wav, format="wav")
+            active_in_wav = temp_conv_wav
 
     # Extract dialogue intervals with safety padding
     raw_intervals = []
-    for seg in segments:
+    for seg in (segments or []):
         st_sec = seg.start if hasattr(seg, 'start') else float(seg.get('start', 0.0))
         et_sec = seg.end if hasattr(seg, 'end') else float(seg.get('end', st_sec + 2.0))
         if et_sec > st_sec:
             raw_intervals.append((max(0.0, st_sec - pre_pad_sec), et_sec + post_pad_sec))
 
-    if not raw_intervals:
-        audio_scaled = audio + (20 * math.log10(clamped_vol))
-        audio_scaled.export(output_bgm_path, format="wav")
-        return output_bgm_path
-
     # Sort and cluster intervals separated by less than min_gap_sec
-    raw_intervals.sort(key=lambda x: x[0])
     merged_intervals = []
-    for st, et in raw_intervals:
-        if not merged_intervals:
-            merged_intervals.append([st, et])
-        else:
-            prev_st, prev_et = merged_intervals[-1]
-            if st <= prev_et + min_gap_sec:
-                merged_intervals[-1][1] = max(prev_et, et)
-            else:
+    if raw_intervals:
+        raw_intervals.sort(key=lambda x: x[0])
+        for st, et in raw_intervals:
+            if not merged_intervals:
                 merged_intervals.append([st, et])
+            else:
+                prev_st, prev_et = merged_intervals[-1]
+                if st <= prev_et + min_gap_sec:
+                    merged_intervals[-1][1] = max(prev_et, et)
+                else:
+                    merged_intervals.append([st, et])
 
     # Compute duck gain multiplier (e.g. -60dB -> 0.001, <= -70dB -> 0.0)
     if duck_speech_db <= -70.0:
@@ -199,50 +213,79 @@ def create_clean_background_track(
     else:
         duck_gain = max(0.0, float(10.0 ** (duck_speech_db / 20.0)))
 
-    # Gain envelope: 1.0 during pauses (full BGM/effects), smoothly dips to duck_gain during speech
-    gain_envelope = np.ones(total_samples, dtype=np.float32)
     fade_len = int(0.045 * sr)  # 45ms raised-cosine smooth fade
+    chunk_frames = 120 * sr     # 120 seconds per block (~21MB RAM bounded footprint)
 
-    for st_sec, et_sec in merged_intervals:
-        st_samp = max(0, int(st_sec * sr))
-        et_samp = min(total_samples, int(et_sec * sr))
-        if et_samp <= st_samp:
-            continue
+    try:
+        with wave.open(active_in_wav, "rb") as in_wf, wave.open(output_bgm_path, "wb") as out_wf:
+            out_wf.setnchannels(channels)
+            out_wf.setsampwidth(2)
+            out_wf.setframerate(sr)
 
-        # Smooth fade-in down to ducked speech
-        fade_in_st = max(0, st_samp - fade_len)
-        actual_in_len = st_samp - fade_in_st
-        if actual_in_len > 0:
-            t = np.linspace(0.0, np.pi, actual_in_len, dtype=np.float32)
-            # Raised cosine: transitions from 1.0 down to duck_gain
-            curve_down = duck_gain + (1.0 - duck_gain) * 0.5 * (1.0 + np.cos(t))
-            gain_envelope[fade_in_st:st_samp] = np.minimum(gain_envelope[fade_in_st:st_samp], curve_down)
+            total_frames = in_wf.getnframes()
+            curr_frame = 0
 
-        # Full ducking during dialogue
-        gain_envelope[st_samp:et_samp] = np.minimum(gain_envelope[st_samp:et_samp], duck_gain)
+            while curr_frame < total_frames:
+                read_count = min(chunk_frames, total_frames - curr_frame)
+                raw_bytes = in_wf.readframes(read_count)
+                if not raw_bytes:
+                    break
 
-        # Smooth fade-out up to full BGM
-        fade_out_et = min(total_samples, et_samp + fade_len)
-        actual_out_len = fade_out_et - et_samp
-        if actual_out_len > 0:
-            t = np.linspace(0.0, np.pi, actual_out_len, dtype=np.float32)
-            # Raised cosine: transitions from duck_gain up to 1.0
-            curve_up = duck_gain + (1.0 - duck_gain) * 0.5 * (1.0 - np.cos(t))
-            gain_envelope[et_samp:fade_out_et] = np.minimum(gain_envelope[et_samp:fade_out_et], curve_up)
+                raw_chunk = np.frombuffer(raw_bytes, dtype=np.int16).reshape(-1, channels).astype(np.float32)
+                chunk_len = len(raw_chunk)
+                blk_st = curr_frame
+                blk_et = curr_frame + chunk_len
 
-    # Composite audio:
-    # Dialogue intervals: attenuated by duck_gain (zero Chinese vocal leakage)
-    # Pause intervals: 100% full original audio (BGM and effects intact)
-    final_bgm = raw_samples * gain_envelope[:, None] * clamped_vol
-    final_bgm_samples = final_bgm.clip(-32768, 32767).astype(np.int16)
+                blk_env = np.ones(chunk_len, dtype=np.float32)
 
-    import wave
-    with wave.open(output_bgm_path, "wb") as wf:
-        wf.setnchannels(2)
-        wf.setsampwidth(2)
-        wf.setframerate(sr)
-        wf.writeframes(final_bgm_samples.tobytes())
+                # Apply intersecting intervals to this block
+                for st_sec, et_sec in merged_intervals:
+                    st_samp = int(st_sec * sr)
+                    et_samp = int(et_sec * sr)
+                    fade_in_st = max(0, st_samp - fade_len)
+                    fade_out_et = et_samp + fade_len
 
-    logger.info(f"✅ [AudioSeparator] Clean background track created with speech ducking ({duck_speech_db:.1f}dB): {output_bgm_path}")
+                    if fade_out_et <= blk_st or fade_in_st >= blk_et:
+                        continue
+
+                    # Overlap with fade-in curve
+                    if st_samp > blk_st and fade_in_st < blk_et:
+                        local_fade_st = max(blk_st, fade_in_st) - blk_st
+                        local_fade_et = min(blk_et, st_samp) - blk_st
+                        global_fade_st = max(blk_st, fade_in_st) - fade_in_st
+                        global_fade_et = min(blk_et, st_samp) - fade_in_st
+                        t_full = np.linspace(0.0, np.pi, st_samp - fade_in_st, dtype=np.float32)
+                        curve = duck_gain + (1.0 - duck_gain) * 0.5 * (1.0 + np.cos(t_full[global_fade_st:global_fade_et]))
+                        blk_env[local_fade_st:local_fade_et] = np.minimum(blk_env[local_fade_st:local_fade_et], curve)
+
+                    # Overlap with full ducked dialogue region
+                    local_duck_st = max(blk_st, st_samp) - blk_st
+                    local_duck_et = min(blk_et, et_samp) - blk_st
+                    if local_duck_et > local_duck_st:
+                        blk_env[local_duck_st:local_duck_et] = np.minimum(blk_env[local_duck_st:local_duck_et], duck_gain)
+
+                    # Overlap with fade-out curve
+                    if et_samp < blk_et and fade_out_et > blk_st:
+                        local_out_st = max(blk_st, et_samp) - blk_st
+                        local_out_et = min(blk_et, fade_out_et) - blk_st
+                        global_out_st = max(blk_st, et_samp) - et_samp
+                        global_out_et = min(blk_et, fade_out_et) - et_samp
+                        t_full = np.linspace(0.0, np.pi, fade_out_et - et_samp, dtype=np.float32)
+                        curve = duck_gain + (1.0 - duck_gain) * 0.5 * (1.0 - np.cos(t_full[global_out_st:global_out_et]))
+                        blk_env[local_out_st:local_out_et] = np.minimum(blk_env[local_out_st:local_out_et], curve)
+
+                # Scale and clip block
+                processed_chunk = raw_chunk * blk_env[:, None] * clamped_vol
+                out_samples = processed_chunk.clip(-32768, 32767).astype(np.int16)
+                out_wf.writeframes(out_samples.tobytes())
+
+                curr_frame += chunk_len
+
+    finally:
+        if temp_conv_wav and os.path.exists(temp_conv_wav):
+            try: os.remove(temp_conv_wav)
+            except Exception: pass
+
+    logger.info(f"✅ [AudioSeparator] Clean streaming background track created with speech ducking ({duck_speech_db:.1f}dB): {output_bgm_path}")
     return output_bgm_path
 
